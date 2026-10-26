@@ -16,9 +16,11 @@ const NODE_BIN = fs.existsSync(path.join(HOME, ".local/bin/node"))
   : process.execPath;
 const EA_LINT_PATH = path.join(HOME, "shared/tools/ea-lint.mjs");
 
-// Keep 1-shot prompt compact to minimize token burn and stay well below MAX_ARG_STRLEN
-const MAX_PROMPT_BYTES = 48_000;
-const MAX_FILE_SNIPPET_BYTES = 8_000;
+// Keep 1-shot prompt rich enough for full files/diffs while staying below Linux MAX_ARG_STRLEN (128 KB)
+const MAX_PROMPT_BYTES = 96_000;
+const MAX_FILE_SNIPPET_BYTES = 24_000;
+const MAX_ATTACHED_FILES = 8;
+const MAX_DIFF_BYTES = 32_000;
 const EXEC_MAX_BUFFER = 16 * 1024 * 1024;
 
 // Strict Anti-Token-Burner Guardrails
@@ -150,41 +152,93 @@ function readRecentLogs(windowMs = 60 * 60 * 1000) {
   }
 }
 
-async function queryLiveQuotaPool() {
-  const lsAddr = process.env.ANTIGRAVITY_LS_ADDRESS;
-  const csrf = process.env.ANTIGRAVITY_CSRF_TOKEN;
-  if (!lsAddr || !csrf) return null;
-  try {
-    const res = await fetch(
-      `http://${lsAddr}/exa.language_server_pb.LanguageServerService/GetCascadeModelConfigData`,
+let cachedLsConn = null;
+
+async function discoverLsConnection() {
+  if (process.env.ANTIGRAVITY_LS_ADDRESS && process.env.ANTIGRAVITY_CSRF_TOKEN) {
+    return [
       {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "x-codeium-csrf-token": csrf,
-        },
-        body: "{}",
-        signal: AbortSignal.timeout(2500),
-      }
-    );
-    if (!res.ok) return null;
-    const data = await res.json();
-    const configs = data.clientModelConfigs || [];
-    const claudeModel = configs.find((c) =>
-      String(c.modelId || "").startsWith("claude-")
-    );
-    const geminiModel = configs.find((c) =>
-      String(c.modelId || "").startsWith("gemini-")
-    );
-    return {
-      claudeRemaining: claudeModel?.quotaInfo?.remainingFraction ?? null,
-      claudeResetTime: claudeModel?.quotaInfo?.resetTime ?? null,
-      geminiRemaining: geminiModel?.quotaInfo?.remainingFraction ?? null,
-      geminiResetTime: geminiModel?.quotaInfo?.resetTime ?? null,
-    };
-  } catch {
-    return null;
+        lsAddr: process.env.ANTIGRAVITY_LS_ADDRESS,
+        csrf: process.env.ANTIGRAVITY_CSRF_TOKEN,
+      },
+    ];
   }
+  if (cachedLsConn) return [cachedLsConn];
+
+  try {
+    const candidatePids = new Set([process.ppid]);
+    const pgrepOut = await safeExecAsync("pgrep", ["-f", "language_server"], HOME, 2000);
+    if (pgrepOut) {
+      for (const p of pgrepOut.split(/\s+/)) {
+        const num = Number(p);
+        if (num > 0) candidatePids.add(num);
+      }
+    }
+
+    const ssOut = await safeExecAsync("ss", ["-tlpn"], HOME, 2000);
+    const candidates = [];
+
+    for (const pid of candidatePids) {
+      const cmdlinePath = `/proc/${pid}/cmdline`;
+      if (!fs.existsSync(cmdlinePath)) continue;
+      const cmdArgs = fs.readFileSync(cmdlinePath, "utf8").split("\0");
+      const csrfIdx = cmdArgs.indexOf("--csrf_token");
+      if (csrfIdx === -1 || !cmdArgs[csrfIdx + 1]) continue;
+      const csrf = cmdArgs[csrfIdx + 1];
+
+      if (ssOut) {
+        for (const line of ssOut.split("\n")) {
+          if (!line.includes(`pid=${pid},`)) continue;
+          const m = line.match(/127\.0\.0\.1:(\d+)/);
+          if (m) {
+            candidates.push({ lsAddr: `127.0.0.1:${m[1]}`, csrf });
+          }
+        }
+      }
+    }
+    return candidates;
+  } catch {
+    return [];
+  }
+}
+
+async function queryLiveQuotaPool() {
+  const candidates = await discoverLsConnection();
+  for (const { lsAddr, csrf } of candidates) {
+    try {
+      const res = await fetch(
+        `http://${lsAddr}/exa.language_server_pb.LanguageServerService/GetCascadeModelConfigData`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "x-codeium-csrf-token": csrf,
+          },
+          body: "{}",
+          signal: AbortSignal.timeout(2000),
+        }
+      );
+      if (!res.ok) continue;
+      const data = await res.json();
+      cachedLsConn = { lsAddr, csrf };
+      const configs = data.clientModelConfigs || [];
+      const claudeModel = configs.find((c) =>
+        String(c.modelId || "").startsWith("claude-")
+      );
+      const geminiModel = configs.find((c) =>
+        String(c.modelId || "").startsWith("gemini-")
+      );
+      return {
+        claudeRemaining: claudeModel?.quotaInfo?.remainingFraction ?? null,
+        claudeResetTime: claudeModel?.quotaInfo?.resetTime ?? null,
+        geminiRemaining: geminiModel?.quotaInfo?.remainingFraction ?? null,
+        geminiResetTime: geminiModel?.quotaInfo?.resetTime ?? null,
+      };
+    } catch {
+      // Try next candidate port
+    }
+  }
+  return null;
 }
 
 function sendDesktopToast(title, body) {
@@ -348,13 +402,14 @@ async function gatherWorkspaceContext({
   let changedLineCount = null;
 
   // Attach target file snippets directly in Node.js (0 model tool turns needed)
-  for (const filePath of resolvedFiles.slice(0, 4)) {
+  const fileCapKb = Math.round(MAX_FILE_SNIPPET_BYTES / 1000);
+  for (const filePath of resolvedFiles.slice(0, MAX_ATTACHED_FILES)) {
     try {
       if (fs.existsSync(filePath) && fs.statSync(filePath).isFile()) {
         const raw = fs.readFileSync(filePath, "utf8");
         const clipped =
           Buffer.byteLength(raw, "utf8") > MAX_FILE_SNIPPET_BYTES
-            ? `${Buffer.from(raw, "utf8").subarray(0, MAX_FILE_SNIPPET_BYTES).toString("utf8")}\n... [truncated at 8 KB]`
+            ? `${Buffer.from(raw, "utf8").subarray(0, MAX_FILE_SNIPPET_BYTES).toString("utf8")}\n... [truncated at ${fileCapKb} KB]`
             : raw;
         contextBlocks.push(
           `## File Content: ${filePath}\n\`\`\`\n${clipped}\n\`\`\``
@@ -372,7 +427,7 @@ async function gatherWorkspaceContext({
     const lintTargets =
       resolvedFiles.length > 0 ? resolvedFiles : [resolvedWorkspace];
     const lintOutputs = [];
-    for (const target of lintTargets.slice(0, 4)) {
+    for (const target of lintTargets.slice(0, MAX_ATTACHED_FILES)) {
       if (fs.existsSync(target)) {
         const out = await safeExecAsync(
           NODE_BIN,
@@ -403,7 +458,7 @@ async function gatherWorkspaceContext({
       4000
     );
     if (isGitRepo === "true") {
-      const [statusOut, untrackedOut, diffStatOut, diffOut] = await Promise.all([
+      let [statusOut, untrackedOut, diffStatOut, diffOut] = await Promise.all([
         safeExecAsync("git", ["status", "--short"], resolvedWorkspace, 5000),
         safeExecAsync(
           "git",
@@ -415,6 +470,31 @@ async function gatherWorkspaceContext({
         safeExecAsync("git", ["diff", "HEAD"], resolvedWorkspace, 6000),
       ]);
 
+      let diffLabel = "git diff HEAD";
+      // If working tree has no tracked modifications (e.g. right after git commit or git pull),
+      // automatically fall back to the latest commit (`git show HEAD`) so --diff still has real context.
+      if (!diffOut && !untrackedOut) {
+        const [headStatOut, headDiffOut] = await Promise.all([
+          safeExecAsync(
+            "git",
+            ["show", "--stat", "--format=oneline", "HEAD"],
+            resolvedWorkspace,
+            5000
+          ),
+          safeExecAsync(
+            "git",
+            ["show", "--format=oneline", "HEAD"],
+            resolvedWorkspace,
+            6000
+          ),
+        ]);
+        if (headDiffOut) {
+          diffStatOut = headStatOut;
+          diffOut = headDiffOut;
+          diffLabel = "git show HEAD (working tree clean)";
+        }
+      }
+
       gitStatus = statusOut || "";
       gitUntracked = untrackedOut || "";
       gitDiff = diffOut || "";
@@ -425,7 +505,7 @@ async function gatherWorkspaceContext({
         "```text",
         `git status --short:\n${gitStatus || "(clean)"}`,
         "",
-        `git diff --stat HEAD:\n${diffStatOut || "(no tracked diff)"}`,
+        `${diffLabel} --stat:\n${diffStatOut || "(no tracked diff)"}`,
       ];
       if (gitUntracked) {
         stateLines.push("", `Untracked files:\n${gitUntracked}`);
@@ -434,12 +514,15 @@ async function gatherWorkspaceContext({
       contextBlocks.push(stateLines.join("\n"));
 
       if (gitDiff) {
+        const diffCapKb = Math.round(MAX_DIFF_BYTES / 1000);
         const clippedDiff =
-          Buffer.byteLength(gitDiff, "utf8") > 12000
-            ? `${Buffer.from(gitDiff, "utf8").subarray(0, 12000).toString("utf8")}\n... [diff truncated at 12 KB]`
+          Buffer.byteLength(gitDiff, "utf8") > MAX_DIFF_BYTES
+            ? `${Buffer.from(gitDiff, "utf8").subarray(0, MAX_DIFF_BYTES).toString("utf8")}\n... [diff truncated at ${diffCapKb} KB]`
             : gitDiff;
         contextBlocks.push(
-          ["## Git Diff Preview", "```diff", clippedDiff, "```"].join("\n")
+          [`## Git Diff Preview (${diffLabel})`, "```diff", clippedDiff, "```"].join(
+            "\n"
+          )
         );
       }
     }
