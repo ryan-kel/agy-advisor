@@ -26,8 +26,6 @@ const EXEC_MAX_BUFFER = 16 * 1024 * 1024;
 // Strict Anti-Token-Burner Guardrails
 const COOLDOWN_MS = 120 * 1000; // 2m minimum between automatic calls in the same workspace
 const CACHE_TTL_MS = 60 * 60 * 1000; // 60m exact-match deduplication cache
-const HOURLY_DOWNSHIFT_THRESHOLD = 3; // After 3 calls/hr, force sonnet-low
-const HOURLY_HARD_CAP = 6; // Max 6 automatic advisor calls per hour
 const QUOTA_FLOOR_FRACTION = 0.35; // Never run automatic advisor calls if Claude quota < 35%
 const TRIVIAL_DIFF_CHANGED_LINES = 20; // Skip automatic code diff review if <20 changed lines
 
@@ -325,9 +323,7 @@ function writeResponseCache(cacheKey, text) {
 function resolveTierAndModel(
   tierOrModel = "auto",
   explicitEffort,
-  focus = "general",
-  hourlyCallCount = 0,
-  force = false
+  focus = "general"
 ) {
   let key = String(tierOrModel || "auto").trim().toLowerCase();
 
@@ -340,10 +336,6 @@ function resolveTierAndModel(
     } else {
       key = "sonnet-medium";
     }
-  }
-
-  if (!force && hourlyCallCount >= HOURLY_DOWNSHIFT_THRESHOLD) {
-    key = "sonnet-low";
   }
 
   if (TIER_PRESETS[key]) {
@@ -703,23 +695,13 @@ export async function runAdvisorConsult({
     };
   }
 
-  // Check recent call history for rate limiting & cooldown
+  // Check recent call history for per-workspace cooldown
   const recentHourLogs = readRecentLogs(60 * 60 * 1000);
-
-  // Token Guard 3: Hourly Hard Cap
-  if (!force && recentHourLogs.length >= HOURLY_HARD_CAP) {
-    return {
-      isError: false,
-      text: `> [!WARNING] **Advisor Hourly Cap Reached (0 tokens used)** — ${recentHourLogs.length}/${HOURLY_HARD_CAP} calls used in the last 60 minutes. Skipping automatic call. Pass \`--force\` to override.`,
-    };
-  }
 
   const { model, effort: resolvedEffort, label } = resolveTierAndModel(
     tier,
     effort,
-    ctx.focusKey,
-    recentHourLogs.length,
-    force
+    ctx.focusKey
   );
 
   // Token Guard 4: Exact-Match Deduplication Cache (0 tokens spent)
@@ -993,7 +975,7 @@ export async function checkAdvisorQuota() {
   sections.push(
     "",
     "### 2. Recent Advisor Calls (What Used Your Tokens)",
-    `Calls in last 60 minutes: **${recentHourLogs.length}/${HOURLY_HARD_CAP}** (Floor guard: stops automatic calls below ${QUOTA_FLOOR_FRACTION * 100}% quota)`
+    `Calls in last 60 minutes: **${recentHourLogs.length}** (No hourly cap; live floor guard stops automatic calls below ${QUOTA_FLOOR_FRACTION * 100}% quota)`
   );
 
   if (allRecentLogs.length === 0) {

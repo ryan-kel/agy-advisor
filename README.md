@@ -32,5 +32,5 @@ cd ~/projects/agy-advisor && git pull && bash install.sh
 2. **Trivial Diff Skip (`0 tokens`)**: If `--focus code --diff` is run on a git diff with `< 12` changed lines and no untracked files, it returns an instant fast-path pass without spawning a model session.
 3. **30-Minute Exact-Match Deduplication Cache (`0 tokens`)**: Identical `(model, focus, workspace, files, prompt, gitStatus, gitDiff)` requests return the cached audit from `~/.gemini/antigravity/plugin_data/advisor/advisor-cache.json`.
 4. **60-Second Workspace Cooldown (`0 tokens`)**: Prevents Gemini from calling the advisor multiple times in a fix-review-fix loop within the same workspace.
-5. **Hourly Rate Limiter & Auto-Downshift**: Automatically downshifts `opus-high` to `sonnet-medium` after 5 calls in 60 minutes, and caps automatic calls at 10 per hour (pass `--force` to override any guard when you explicitly ask for a review).
+5. **Live Quota Floor Guard (`35%`)**: Uses live Antigravity quota telemetry rather than arbitrary hourly call caps—only pausing automatic calls if your Claude subscription pool ever drops below 35% (pass `--force` to override any guard when you explicitly ask for a review).
 6. **Hard 2-Turn Tool Budget & 85s Print Timeout**: Keeps advisor sessions focused on the pre-attached diff and target files instead of wandering the repository.
