@@ -6,19 +6,19 @@ function printHelp() {
   console.log(`Usage: advisor-consult [options] [prompt | -]
 
 Cross-model advisor CLI powered by Antigravity subscription models
-(smart auto-tiering in strict read-only advisor-engine mode).
+(1-shot zero-tool mode with live quota tracking and anti-burner guards).
 
 Options:
+  --status, --models   Show live subscription quota %, recent advisor call log, and tiers
   --focus <mode>       Review mode: plan | code | prose | math | general (default: general)
-  --tier <preset>      Model preset: auto (default) | deep (Opus 5.5 High) | fast (Sonnet 5.5 High) |
-                       opus-medium | sonnet-medium | gpt-oss | <model-id>
+  --tier <preset>      Model preset: auto (default, Sonnet 5.5 1-shot) | deep (Opus 5.5 Med) |
+                       opus-high | fast | sonnet-low | gpt-oss | <model-id>
   --model <model-id>   Alias for --tier
   --effort <level>     Reasoning effort: low | medium | high | xhigh | max
   --workspace <dir>    Workspace root directory (default: current directory)
-  --file <path>        Target file to inspect (repeatable)
+  --file <path>        Target file to attach and inspect (repeatable)
   --diff               Include git status and git diff HEAD from workspace
-  --force              Bypass 60s workspace cooldown, trivial-diff skip, and cache
-  --models             List available subscription models and active token guardrails
+  --force              Bypass 120s cooldown, 35% quota floor, trivial-diff skip, and cache
   -h, --help           Show this help message
 `);
 }
@@ -47,7 +47,7 @@ async function main() {
     if (arg === "-h" || arg === "--help") {
       printHelp();
       process.exit(0);
-    } else if (arg === "--models") {
+    } else if (arg === "--models" || arg === "--status" || arg === "--log") {
       const res = await checkAdvisorQuota();
       console.log(res.text);
       process.exit(0);

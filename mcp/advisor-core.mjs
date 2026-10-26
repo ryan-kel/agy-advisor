@@ -15,35 +15,35 @@ const NODE_BIN = fs.existsSync(path.join(HOME, ".local/bin/node"))
   ? path.join(HOME, ".local/bin/node")
   : process.execPath;
 const EA_LINT_PATH = path.join(HOME, "shared/tools/ea-lint.mjs");
-const SHARED_DIR = path.join(HOME, "shared");
-const EA_STYLE_DIR = path.join(HOME, "sites/electoralanalytics-site/docs/style");
 
-// Keep argv prompt well under Linux MAX_ARG_STRLEN (131,072 bytes)
-const MAX_PROMPT_BYTES = 96_000;
+// Keep 1-shot prompt compact to minimize token burn and stay well below MAX_ARG_STRLEN
+const MAX_PROMPT_BYTES = 48_000;
+const MAX_FILE_SNIPPET_BYTES = 8_000;
 const EXEC_MAX_BUFFER = 16 * 1024 * 1024;
 
-// Token-protection constants
-const COOLDOWN_MS = 60 * 1000; // 60s minimum between automatic calls in the same workspace
-const CACHE_TTL_MS = 30 * 60 * 1000; // 30m exact-match deduplication cache
-const HOURLY_DOWNSHIFT_THRESHOLD = 5; // After 5 calls/hr, auto-downshift opus-high -> sonnet-medium
-const HOURLY_HARD_CAP = 10; // After 10 calls/hr, block non-forced calls
-const TRIVIAL_DIFF_CHANGED_LINES = 12; // Skip code diff review if <12 changed lines and no untracked files
+// Strict Anti-Token-Burner Guardrails
+const COOLDOWN_MS = 120 * 1000; // 2m minimum between automatic calls in the same workspace
+const CACHE_TTL_MS = 60 * 60 * 1000; // 60m exact-match deduplication cache
+const HOURLY_DOWNSHIFT_THRESHOLD = 3; // After 3 calls/hr, force sonnet-low
+const HOURLY_HARD_CAP = 6; // Max 6 automatic advisor calls per hour
+const QUOTA_FLOOR_FRACTION = 0.35; // Never run automatic advisor calls if Claude quota < 35%
+const TRIVIAL_DIFF_CHANGED_LINES = 20; // Skip automatic code diff review if <20 changed lines
 
 export const TIER_PRESETS = {
   deep: {
-    model: "claude-opus-5-5-high",
-    effort: "high",
-    label: "Claude Opus 5.5 (High)",
-  },
-  opus: {
-    model: "claude-opus-5-5-high",
-    effort: "high",
-    label: "Claude Opus 5.5 (High)",
+    model: "claude-opus-5-5-medium",
+    effort: "medium",
+    label: "Claude Opus 5.5 (Medium)",
   },
   "opus-high": {
     model: "claude-opus-5-5-high",
     effort: "high",
     label: "Claude Opus 5.5 (High)",
+  },
+  opus: {
+    model: "claude-opus-5-5-medium",
+    effort: "medium",
+    label: "Claude Opus 5.5 (Medium)",
   },
   "opus-medium": {
     model: "claude-opus-5-5-medium",
@@ -56,14 +56,14 @@ export const TIER_PRESETS = {
     label: "Claude Opus 5.5 (Low)",
   },
   fast: {
-    model: "claude-sonnet-5-5-high",
-    effort: "high",
-    label: "Claude Sonnet 5.5 (High)",
+    model: "claude-sonnet-5-5-medium",
+    effort: "medium",
+    label: "Claude Sonnet 5.5 (Medium)",
   },
   sonnet: {
-    model: "claude-sonnet-5-5-high",
-    effort: "high",
-    label: "Claude Sonnet 5.5 (High)",
+    model: "claude-sonnet-5-5-medium",
+    effort: "medium",
+    label: "Claude Sonnet 5.5 (Medium)",
   },
   "sonnet-high": {
     model: "claude-sonnet-5-5-high",
@@ -90,31 +90,27 @@ export const TIER_PRESETS = {
 const FOCUS_INSTRUCTIONS = {
   plan: [
     "Audit this implementation or architectural plan.",
-    "1. Check whether the plan violates any local AGENTS.md, README.md, or ~/shared/docs/workspace-routing.md constraints.",
-    "2. Identify flawed assumptions, missing edge cases, race conditions, data-provenance gaps, or unnecessary complexity.",
-    "3. Propose concrete simplifications or corrections before implementation starts.",
+    "1. Identify flawed assumptions, missing edge cases, race conditions, data-provenance gaps, or unnecessary complexity.",
+    "2. Propose concrete simplifications or corrections before implementation starts.",
   ].join("\n"),
   code: [
-    "Perform a rigorous cross-model code review.",
-    "1. Inspect the modified files and git diff for logic bugs, off-by-one errors, unhandled failure modes, security issues, and regressions.",
-    "2. Verify that existing tests, contracts, and documentation integrity are preserved.",
-    "3. Provide exact file/line references and drop-in fixes for every defect found.",
+    "Perform a concise, high-signal cross-model code review.",
+    "1. Inspect the attached diff and file excerpts for logic bugs, off-by-one errors, unhandled failure modes, security issues, and regressions.",
+    "2. Provide exact file/line references and drop-in fixes for every defect found.",
   ].join("\n"),
   math: [
     "Audit all quantitative claims, calculations, rates, and dollar figures.",
-    "1. Trace every number back to the underlying data/ files, scripts, and primary government/agency sources.",
-    "2. Check denominators, date ranges, unit conversions, rounding, and aggregation formulas.",
-    "3. Flag any blended metrics (e.g., incompatible measurement systems) or unverified claims.",
+    "1. Check denominators, date ranges, unit conversions, rounding, and aggregation formulas.",
+    "2. Flag any blended metrics or unverified claims.",
   ].join("\n"),
   prose: [
     "Audit this prose, documentation, or essay draft for clarity, factual precision, and structural rigor.",
-    "1. Check that claims are backed by linked primary sources or workspace evidence and that the tone matches the target audience.",
-    "2. If ~/shared/docs/agent-lessons.md or ~/sites/electoralanalytics-site/docs/style/ exists on this machine, also enforce Track A/B/C voice compliance, calibrator alignment, and inline-style bans.",
-    "3. Flag any editorializing, internal workshop jargon, sensationalized titles, or linter violations.",
+    "1. Check that claims match attached evidence and that the tone matches the target audience.",
+    "2. Flag any editorializing, internal workshop jargon, sensationalized titles, inline style attributes, or linter violations.",
   ].join("\n"),
   general: [
-    "Provide a rigorous, independent second opinion on the problem, work, or question below.",
-    "Verify claims directly against workspace files where applicable, identify mistakes or blind spots, and state concrete recommendations.",
+    "Provide a concise, independent second opinion on the problem, work, or question below.",
+    "Identify mistakes or blind spots and state concrete recommendations.",
   ].join("\n"),
 };
 
@@ -131,7 +127,11 @@ function readRecentLogs(windowMs = 60 * 60 * 1000) {
     const logPath = path.join(getDataDir(), "advisor-log.jsonl");
     if (!fs.existsSync(logPath)) return [];
     const cutoff = Date.now() - windowMs;
-    const lines = fs.readFileSync(logPath, "utf8").trim().split("\n").filter(Boolean);
+    const lines = fs
+      .readFileSync(logPath, "utf8")
+      .trim()
+      .split("\n")
+      .filter(Boolean);
     const recent = [];
     for (const line of lines.slice(-100)) {
       try {
@@ -147,6 +147,56 @@ function readRecentLogs(windowMs = 60 * 60 * 1000) {
     return recent;
   } catch {
     return [];
+  }
+}
+
+async function queryLiveQuotaPool() {
+  const lsAddr = process.env.ANTIGRAVITY_LS_ADDRESS;
+  const csrf = process.env.ANTIGRAVITY_CSRF_TOKEN;
+  if (!lsAddr || !csrf) return null;
+  try {
+    const res = await fetch(
+      `http://${lsAddr}/exa.language_server_pb.LanguageServerService/GetCascadeModelConfigData`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-codeium-csrf-token": csrf,
+        },
+        body: "{}",
+        signal: AbortSignal.timeout(2500),
+      }
+    );
+    if (!res.ok) return null;
+    const data = await res.json();
+    const configs = data.clientModelConfigs || [];
+    const claudeModel = configs.find((c) =>
+      String(c.modelId || "").startsWith("claude-")
+    );
+    const geminiModel = configs.find((c) =>
+      String(c.modelId || "").startsWith("gemini-")
+    );
+    return {
+      claudeRemaining: claudeModel?.quotaInfo?.remainingFraction ?? null,
+      claudeResetTime: claudeModel?.quotaInfo?.resetTime ?? null,
+      geminiRemaining: geminiModel?.quotaInfo?.remainingFraction ?? null,
+      geminiResetTime: geminiModel?.quotaInfo?.resetTime ?? null,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function sendDesktopToast(title, body) {
+  try {
+    const child = spawn(
+      "notify-send",
+      ["-a", "Antigravity Advisor", "-t", "5000", title, body],
+      { stdio: "ignore", detached: true }
+    );
+    child.unref();
+  } catch {
+    // Ignore if notify-send is unavailable
   }
 }
 
@@ -177,7 +227,6 @@ function writeResponseCache(cacheKey, text) {
       }
     }
     const now = Date.now();
-    // Prune expired or excess entries (keep at most 20)
     const entries = Object.entries(cache)
       .filter(([, v]) => v && now - v.ts <= CACHE_TTL_MS)
       .sort((a, b) => b[1].ts - a[1].ts)
@@ -194,36 +243,24 @@ function resolveTierAndModel(
   tierOrModel = "auto",
   explicitEffort,
   focus = "general",
-  changedLineCount = null,
   hourlyCallCount = 0,
   force = false
 ) {
   let key = String(tierOrModel || "auto").trim().toLowerCase();
 
-  // Smart auto-tiering:
-  // - High-stakes reasoning (plan, math, prose) -> Claude Opus 5.5 (High)
-  // - Code / general -> Claude Sonnet 5.5 (Medium for <150 changed lines, High for >=150 lines)
+  // Token-conscious auto-tiering:
+  // - Default automatic checks use Claude Sonnet 5.5 (Medium) in 1-shot mode (~10x lighter on quota than Opus High)
+  // - Use `deep` (Opus 5.5 Medium) or `opus-high` only when explicitly requested
   if (key === "auto") {
-    if (focus === "plan" || focus === "math" || focus === "prose") {
-      key = "opus-high";
-    } else if (
-      changedLineCount !== null &&
-      changedLineCount > 0 &&
-      changedLineCount < 150
-    ) {
-      key = "sonnet-medium";
-    } else {
+    if (focus === "math" || focus === "prose") {
       key = "sonnet-high";
+    } else {
+      key = "sonnet-medium";
     }
   }
 
-  // Automatic quota downshift if hourly call volume is high
-  if (
-    !force &&
-    hourlyCallCount >= HOURLY_DOWNSHIFT_THRESHOLD &&
-    (key === "deep" || key === "opus" || key === "opus-high")
-  ) {
-    key = "sonnet-medium";
+  if (!force && hourlyCallCount >= HOURLY_DOWNSHIFT_THRESHOLD) {
+    key = "sonnet-low";
   }
 
   if (TIER_PRESETS[key]) {
@@ -235,7 +272,7 @@ function resolveTierAndModel(
   }
   return {
     model: key,
-    effort: explicitEffort || "high",
+    effort: explicitEffort || "medium",
     label: key,
   };
 }
@@ -310,14 +347,32 @@ async function gatherWorkspaceContext({
   let gitUntracked = "";
   let changedLineCount = null;
 
-  // Run deterministic ea-lint.mjs automatically when focus is prose or files are under ~/sites
+  // Attach target file snippets directly in Node.js (0 model tool turns needed)
+  for (const filePath of resolvedFiles.slice(0, 4)) {
+    try {
+      if (fs.existsSync(filePath) && fs.statSync(filePath).isFile()) {
+        const raw = fs.readFileSync(filePath, "utf8");
+        const clipped =
+          Buffer.byteLength(raw, "utf8") > MAX_FILE_SNIPPET_BYTES
+            ? `${Buffer.from(raw, "utf8").subarray(0, MAX_FILE_SNIPPET_BYTES).toString("utf8")}\n... [truncated at 8 KB]`
+            : raw;
+        contextBlocks.push(
+          `## File Content: ${filePath}\n\`\`\`\n${clipped}\n\`\`\``
+        );
+      }
+    } catch {
+      // Ignore unreadable files
+    }
+  }
+
+  // Run deterministic ea-lint.mjs automatically if present and working under ~/sites
   const sitesWork =
     isUnderSites(resolvedWorkspace) || resolvedFiles.some((f) => isUnderSites(f));
   if ((focusKey === "prose" || sitesWork) && fs.existsSync(EA_LINT_PATH)) {
     const lintTargets =
       resolvedFiles.length > 0 ? resolvedFiles : [resolvedWorkspace];
     const lintOutputs = [];
-    for (const target of lintTargets.slice(0, 6)) {
+    for (const target of lintTargets.slice(0, 4)) {
       if (fs.existsSync(target)) {
         const out = await safeExecAsync(
           NODE_BIN,
@@ -328,7 +383,7 @@ async function gatherWorkspaceContext({
         );
         if (out) {
           lintOutputs.push(
-            `### ea-lint.mjs (${target})\n\`\`\`text\n${out.slice(0, 3000)}\n\`\`\``
+            `### ea-lint.mjs (${target})\n\`\`\`text\n${out.slice(0, 2500)}\n\`\`\``
           );
         }
       }
@@ -373,18 +428,15 @@ async function gatherWorkspaceContext({
         `git diff --stat HEAD:\n${diffStatOut || "(no tracked diff)"}`,
       ];
       if (gitUntracked) {
-        stateLines.push(
-          "",
-          `Untracked files (inspect with read_file if relevant):\n${gitUntracked}`
-        );
+        stateLines.push("", `Untracked files:\n${gitUntracked}`);
       }
       stateLines.push("```");
       contextBlocks.push(stateLines.join("\n"));
 
       if (gitDiff) {
         const clippedDiff =
-          Buffer.byteLength(gitDiff, "utf8") > 14000
-            ? `${Buffer.from(gitDiff, "utf8").subarray(0, 14000).toString("utf8")}\n... [diff truncated at 14 KB; use read_file on modified files if needed]`
+          Buffer.byteLength(gitDiff, "utf8") > 12000
+            ? `${Buffer.from(gitDiff, "utf8").subarray(0, 12000).toString("utf8")}\n... [diff truncated at 12 KB]`
             : gitDiff;
         contextBlocks.push(
           ["## Git Diff Preview", "```diff", clippedDiff, "```"].join("\n")
@@ -409,58 +461,32 @@ function buildAdvisorPrompt({
   prompt,
   focusKey,
   resolvedWorkspace,
-  resolvedFiles,
   contextBlocks,
 }) {
   const coreSections = [
-    "[ADVISOR REVIEW REQUEST]",
-    "You are acting as the independent Cross-Model Advisor reviewing work or plans produced by Gemini.",
-    "CRITICAL CONSTRAINTS:",
-    "1. Do NOT call `consult_advisor`, `advisor-consult`, or `invoke_subagent`. You ARE the advisor.",
-    "2. TOKEN DISCIPLINE: Rely on the diff/context below first. Make at most 1-2 targeted `read_file` calls only if required to verify surrounding lines or data sources.",
-    "",
-    `## Review Focus (${focusKey.toUpperCase()})`,
+    "[ADVISOR REVIEW REQUEST — 1-SHOT MODE]",
+    `Review Focus: ${focusKey.toUpperCase()} | Workspace: ${resolvedWorkspace}`,
     FOCUS_INSTRUCTIONS[focusKey],
-    "",
-    `## Active Workspace`,
-    resolvedWorkspace,
-  ];
-
-  if (resolvedFiles.length > 0) {
-    coreSections.push(
-      "",
-      "## Target Files to Inspect",
-      ...resolvedFiles.map((f) => `- ${f}`)
-    );
-  }
-
-  coreSections.push(
     "",
     "## Task / Material Under Review",
     String(prompt || "").trim(),
     "",
     "## Required Output Format",
-    "Respond concisely with:",
-    "1. **Verdict**: `APPROVE`, `REVISE`, or `BLOCK` (with a 1-sentence summary).",
-    "2. **Mistakes & Risks Caught**: Numbered list ordered by severity (cite exact file paths, line numbers, or calculations).",
-    "3. **Concrete Fixes**: Specific changes or corrections required.",
-    "4. **Unchecked Assumptions**: Anything that still needs primary-source or test verification."
-  );
+    "1. **Verdict**: `APPROVE`, `REVISE`, or `BLOCK` (1 sentence).",
+    "2. **Mistakes & Risks Caught**: Numbered list ordered by severity (cite file/line or calculation).",
+    "3. **Concrete Fixes**: Specific changes required.",
+  ];
 
   let text = coreSections.join("\n");
   if (Buffer.byteLength(text, "utf8") > MAX_PROMPT_BYTES) {
-    const buf = Buffer.from(text, "utf8").subarray(0, MAX_PROMPT_BYTES - 256);
-    return (
-      buf.toString("utf8") +
-      "\n\n[Prompt truncated to fit argv byte budget; inspect target files directly with read_file.]"
-    );
+    const buf = Buffer.from(text, "utf8").subarray(0, MAX_PROMPT_BYTES - 128);
+    return buf.toString("utf8") + "\n\n[Prompt truncated to fit byte budget.]";
   }
 
   for (const block of contextBlocks) {
     const candidate = `${text}\n\n${block}`;
     if (Buffer.byteLength(candidate, "utf8") > MAX_PROMPT_BYTES) {
-      text +=
-        "\n\n[Additional context omitted to stay within byte budget; inspect files directly with read_file.]";
+      text += "\n\n[Additional context omitted to conserve token quota.]";
       break;
     }
     text = candidate;
@@ -487,13 +513,13 @@ export async function runAdvisorConsult({
   files = [],
   includeGitDiff = false,
   force = false,
-  timeoutMs = 90000,
+  timeoutMs = 60000,
   signal,
 }) {
   if (process.env.AGY_ADVISOR_ACTIVE === "1") {
     return {
       isError: true,
-      text: "Advisor recursion blocked: AGY_ADVISOR_ACTIVE=1 is already set in this environment. Perform the review directly without re-invoking the advisor.",
+      text: "Advisor recursion blocked: AGY_ADVISOR_ACTIVE=1 is already set in this environment.",
     };
   }
 
@@ -523,18 +549,33 @@ export async function runAdvisorConsult({
   ) {
     return {
       isError: false,
-      text: `### Advisor Fast-Path Skip (0 tokens used)\n**Verdict**: \`APPROVE\` — Git diff in \`${ctx.resolvedWorkspace}\` has only ${ctx.changedLineCount} changed line(s) (<${TRIVIAL_DIFF_CHANGED_LINES} line threshold) and no untracked files. Skipping cross-model call to conserve quota. Pass \`--force\` to override.`,
+      text: `> [!NOTE] **Advisor Skipped (0 tokens used)** — Diff in \`${ctx.resolvedWorkspace}\` has ${ctx.changedLineCount} changed line(s) (<${TRIVIAL_DIFF_CHANGED_LINES}-line threshold).`,
+    };
+  }
+
+  // Token Guard 2: Live Quota Floor Check (<35% remaining skips automatic calls)
+  const preQuota = await queryLiveQuotaPool();
+  if (
+    !force &&
+    preQuota &&
+    typeof preQuota.claudeRemaining === "number" &&
+    preQuota.claudeRemaining < QUOTA_FLOOR_FRACTION
+  ) {
+    const pct = (preQuota.claudeRemaining * 100).toFixed(1);
+    return {
+      isError: false,
+      text: `> [!WARNING] **Advisor Quota Guard (0 tokens used)** — Claude subscription pool is at ${pct}% (<${QUOTA_FLOOR_FRACTION * 100}% floor). Skipping automatic advisor call to preserve your quota. Pass \`--force\` to override.`,
     };
   }
 
   // Check recent call history for rate limiting & cooldown
   const recentHourLogs = readRecentLogs(60 * 60 * 1000);
 
-  // Token Guard 2: Hourly Hard Cap
+  // Token Guard 3: Hourly Hard Cap
   if (!force && recentHourLogs.length >= HOURLY_HARD_CAP) {
     return {
       isError: false,
-      text: `### Advisor Quota Guard (0 tokens used)\n**Verdict**: \`APPROVE\` (Skipped) — ${recentHourLogs.length} advisor calls have already run in the last 60 minutes (hourly cap: ${HOURLY_HARD_CAP}). Skipping automatic advisor call to protect subscription quota. Pass \`--force\` if an explicit review is needed.`,
+      text: `> [!WARNING] **Advisor Hourly Cap Reached (0 tokens used)** — ${recentHourLogs.length}/${HOURLY_HARD_CAP} calls used in the last 60 minutes. Skipping automatic call. Pass \`--force\` to override.`,
     };
   }
 
@@ -542,12 +583,11 @@ export async function runAdvisorConsult({
     tier,
     effort,
     ctx.focusKey,
-    ctx.changedLineCount,
     recentHourLogs.length,
     force
   );
 
-  // Token Guard 3: Exact-Match Deduplication Cache (0 tokens spent)
+  // Token Guard 4: Exact-Match Deduplication Cache (0 tokens spent)
   const cacheKey = crypto
     .createHash("sha256")
     .update(
@@ -568,11 +608,11 @@ export async function runAdvisorConsult({
     if (cachedText) {
       return {
         isError: false,
-        text: `${cachedText}\n\n*(Served from 30m deduplication cache — 0 additional tokens used.)*`,
+        text: `${cachedText}\n\n*(Served from 60m deduplication cache — 0 additional tokens used.)*`,
       };
     }
 
-    // Token Guard 4: Per-Workspace Cooldown (60s)
+    // Token Guard 5: Per-Workspace Cooldown (120s)
     const lastWorkspaceCall = [...recentHourLogs]
       .reverse()
       .find((entry) => entry.workspace === ctx.resolvedWorkspace);
@@ -580,7 +620,7 @@ export async function runAdvisorConsult({
       const agoSec = Math.round((Date.now() - lastWorkspaceCall.ts) / 1000);
       return {
         isError: false,
-        text: `### Advisor Cooldown Active (0 tokens used)\nAdvisor already audited \`${ctx.resolvedWorkspace}\` ${agoSec}s ago (cooldown: ${COOLDOWN_MS / 1000}s, max 1 advisor call per task). Apply the previous audit feedback and complete the turn without re-polling the advisor, or pass \`--force\` to override.`,
+        text: `> [!NOTE] **Advisor Cooldown Active (0 tokens used)** — Audited \`${ctx.resolvedWorkspace}\` ${agoSec}s ago (cooldown: ${COOLDOWN_MS / 1000}s). Apply previous feedback without re-polling.`,
       };
     }
   }
@@ -589,35 +629,10 @@ export async function runAdvisorConsult({
     prompt,
     focusKey: ctx.focusKey,
     resolvedWorkspace: ctx.resolvedWorkspace,
-    resolvedFiles: ctx.resolvedFiles,
     contextBlocks: ctx.contextBlocks,
   });
 
-  const addDirs = new Set();
-  if (fs.existsSync(ctx.resolvedWorkspace)) {
-    addDirs.add(ctx.resolvedWorkspace);
-  }
-  if (fs.existsSync(SHARED_DIR)) {
-    addDirs.add(SHARED_DIR);
-  }
-  if (ctx.focusKey === "prose" && fs.existsSync(EA_STYLE_DIR)) {
-    addDirs.add(EA_STYLE_DIR);
-  }
-  for (const abs of ctx.resolvedFiles) {
-    try {
-      const dir =
-        fs.existsSync(abs) && fs.statSync(abs).isDirectory()
-          ? abs
-          : path.dirname(abs);
-      if (fs.existsSync(dir)) {
-        addDirs.add(dir);
-      }
-    } catch {
-      // Ignore inaccessible file paths
-    }
-  }
-
-  const printTimeoutSec = Math.max(30, Math.floor(timeoutMs / 1000) - 5);
+  const printTimeoutSec = Math.max(25, Math.floor(timeoutMs / 1000) - 5);
   const args = [
     "--agent",
     "advisor-engine",
@@ -630,11 +645,14 @@ export async function runAdvisorConsult({
     "--sandbox",
     "--print-timeout",
     `${printTimeoutSec}s`,
+    `-p=${fullPrompt}`,
   ];
-  for (const d of addDirs) {
-    args.push("--add-dir", d);
-  }
-  args.push(`-p=${fullPrompt}`);
+
+  // Fire visible desktop toast so the user sees immediately when the advisor runs
+  sendDesktopToast(
+    `Advisor Running: ${label}`,
+    `Focus: ${ctx.focusKey} | ${path.basename(ctx.resolvedWorkspace)}`
+  );
 
   const startTime = Date.now();
 
@@ -703,16 +721,37 @@ export async function runAdvisorConsult({
       });
     });
 
-    child.on("close", (code, exitSignal) => {
+    child.on("close", async (code, exitSignal) => {
       clearTimeout(timer);
       if (signal) signal.removeEventListener("abort", onAbort);
       const durationMs = Date.now() - startTime;
       const cleanOut = stdout.trim();
       const cleanErr = stderr.trim();
 
+      const postQuota = await queryLiveQuotaPool();
+      const claudeRemainingPct =
+        postQuota && typeof postQuota.claudeRemaining === "number"
+          ? `${(postQuota.claudeRemaining * 100).toFixed(1)}%`
+          : null;
+      const quotaDeltaPct =
+        preQuota &&
+        postQuota &&
+        typeof preQuota.claudeRemaining === "number" &&
+        typeof postQuota.claudeRemaining === "number"
+          ? `${Math.max(0, (preQuota.claudeRemaining - postQuota.claudeRemaining) * 100).toFixed(2)}%`
+          : null;
+
       const verdictMatch =
-        cleanOut.match(/(?:\*\*Verdict\*\*|Verdict)\s*:\s*`?(APPROVE|REVISE|BLOCK)`?/i) ||
-        cleanOut.match(/\b(APPROVE|REVISE|BLOCK)\b/);
+        cleanOut.match(
+          /(?:\*\*Verdict\*\*|Verdict)\s*:\s*`?(APPROVE|REVISE|BLOCK)`?/i
+        ) || cleanOut.match(/\b(APPROVE|REVISE|BLOCK)\b/);
+      const verdict = aborted
+        ? "ABORTED"
+        : timedOut
+          ? "TIMEOUT"
+          : verdictMatch
+            ? verdictMatch[1].toUpperCase()
+            : "UNKNOWN";
 
       appendAuditLog({
         timestamp: new Date().toISOString(),
@@ -720,16 +759,12 @@ export async function runAdvisorConsult({
         effort: resolvedEffort,
         focus: ctx.focusKey,
         workspace: ctx.resolvedWorkspace,
+        promptSummary: String(prompt).trim().replace(/\s+/g, " ").slice(0, 140),
         durationMs,
         exitCode: code,
-        exitSignal: exitSignal || undefined,
-        verdict: aborted
-          ? "ABORTED"
-          : timedOut
-            ? "TIMEOUT"
-            : verdictMatch
-              ? verdictMatch[1].toUpperCase()
-              : "UNKNOWN",
+        verdict,
+        claudeRemainingPct,
+        quotaDeltaPct,
       });
 
       if (aborted) {
@@ -757,8 +792,17 @@ export async function runAdvisorConsult({
         return;
       }
 
-      const header = `### Advisor Audit — ${label} [focus: ${ctx.focusKey}, effort: ${resolvedEffort}, ${(durationMs / 1000).toFixed(1)}s]`;
-      const fullResponse = `${header}\n\n${cleanOut}`;
+      const quotaNote = claudeRemainingPct
+        ? ` | Claude Quota: ${claudeRemainingPct} left${quotaDeltaPct ? ` (-${quotaDeltaPct})` : ""}`
+        : "";
+      const banner = [
+        `> [!NOTE] **Advisor Called — ${label}**`,
+        `> - **Focus**: \`${ctx.focusKey}\` | **Workspace**: \`${ctx.resolvedWorkspace}\` | **Time**: ${(durationMs / 1000).toFixed(1)}s${quotaNote}`,
+        `> - **Why**: ${String(prompt).trim().replace(/\s+/g, " ").slice(0, 120)}`,
+        `> - **Verdict**: \`${verdict}\``,
+      ].join("\n");
+
+      const fullResponse = `${banner}\n\n${cleanOut}`;
       writeResponseCache(cacheKey, fullResponse);
       resolve({
         isError: false,
@@ -769,32 +813,85 @@ export async function runAdvisorConsult({
 }
 
 export async function checkAdvisorQuota() {
-  const raw =
-    (await safeExecAsync(AGY_BIN, ["models"], HOME, 10000)) ||
-    "(failed to query agy models)";
-  const lines = raw
+  const [rawModels, liveQuota] = await Promise.all([
+    safeExecAsync(AGY_BIN, ["models"], HOME, 10000),
+    queryLiveQuotaPool(),
+  ]);
+
+  const lines = (rawModels || "(failed to query agy models)")
     .split(/\r?\n/)
     .map((l) => l.replace(/^.*Fetching available models\.\.\.\s*/, "").trim())
     .filter(Boolean);
 
   const recentHourLogs = readRecentLogs(60 * 60 * 1000);
+  const allRecentLogs = readRecentLogs(24 * 60 * 60 * 1000).slice(-10);
+
+  const sections = ["### 1. Live Subscription Quota Status"];
+  if (liveQuota) {
+    const geminiPct =
+      typeof liveQuota.geminiRemaining === "number"
+        ? `${(liveQuota.geminiRemaining * 100).toFixed(1)}%`
+        : "unknown";
+    const claudePct =
+      typeof liveQuota.claudeRemaining === "number"
+        ? `${(liveQuota.claudeRemaining * 100).toFixed(1)}%`
+        : "unknown";
+    sections.push(
+      `- **Gemini Pool** (Argon / Flash): **${geminiPct} remaining** (resets \`${liveQuota.geminiResetTime || "unknown"}\`)`,
+      `- **Claude & Third-Party Pool** (Opus 5.5 / Sonnet 5.5 / GPT-OSS): **${claudePct} remaining** (resets \`${liveQuota.claudeResetTime || "unknown"}\`)`
+    );
+  } else {
+    sections.push(
+      "*(Run inside an active Antigravity session to read live percentage bars, or check `/quota` in `agy`.)*"
+    );
+  }
+
+  sections.push(
+    "",
+    "### 2. Recent Advisor Calls (What Used Your Tokens)",
+    `Calls in last 60 minutes: **${recentHourLogs.length}/${HOURLY_HARD_CAP}** (Floor guard: stops automatic calls below ${QUOTA_FLOOR_FRACTION * 100}% quota)`
+  );
+
+  if (allRecentLogs.length === 0) {
+    sections.push("No advisor calls logged in the last 24 hours.");
+  } else {
+    sections.push(
+      "",
+      "| Time (UTC) | Model | Focus | Duration | Verdict | Quota Left (Delta) | What It Was Used On |",
+      "| --- | --- | --- | --- | --- | --- | --- |"
+    );
+    for (const entry of allRecentLogs) {
+      const timeStr = (entry.timestamp || "").slice(11, 19);
+      const durStr = entry.durationMs
+        ? `${(entry.durationMs / 1000).toFixed(1)}s`
+        : "-";
+      const quotaStr = entry.claudeRemainingPct
+        ? `${entry.claudeRemainingPct}${entry.quotaDeltaPct ? ` (-${entry.quotaDeltaPct})` : ""}`
+        : "(pre-telemetry)";
+      const summary =
+        entry.promptSummary || path.basename(entry.workspace || "unknown");
+      sections.push(
+        `| \`${timeStr}\` | \`${entry.model}\` | \`${entry.focus}\` | ${durStr} | \`${entry.verdict}\` | ${quotaStr} | ${summary} |`
+      );
+    }
+  }
+
+  sections.push(
+    "",
+    "### 3. Configured Tiers (`--tier`)",
+    "- `auto` (Default, 1-shot no-tool mode): Uses `claude-sonnet-5-5-medium` for `code`/`plan`/`general` and `claude-sonnet-5-5-high` for `math`/`prose` (~10x lighter on quota than multi-turn Opus)",
+    "- `deep` / `opus`: `claude-opus-5-5-medium` (1-shot Opus)",
+    "- `opus-high`: `claude-opus-5-5-high` (Heavy Opus — use only when explicitly requested)",
+    "- `fast` / `sonnet`: `claude-sonnet-5-5-medium`",
+    "",
+    "### 4. Available Subscription Models (`agy models`)",
+    "```text",
+    ...lines,
+    "```"
+  );
 
   return {
     isError: false,
-    text: [
-      "### Available Antigravity Subscription Models (`agy models`)",
-      "```text",
-      ...lines,
-      "```",
-      "",
-      "**Configured Advisor Tiers (`--tier`):**",
-      "- `auto` (Default): Smart routing — uses `claude-opus-5-5-high` for `plan`/`math`/`prose`, and `claude-sonnet-5-5-medium` (<150 lines) or `claude-sonnet-5-5-high` (>=150 lines) for `code`/`general`",
-      "- `deep` / `opus`: `claude-opus-5-5-high` (Claude Opus 5.5 High)",
-      "- `fast` / `sonnet`: `claude-sonnet-5-5-high` (Claude Sonnet 5.5 High)",
-      "- `opus-medium`: `claude-opus-5-5-medium` (Claude Opus 5.5 Medium)",
-      "- `sonnet-medium`: `claude-sonnet-5-5-medium` (Claude Sonnet 5.5 Medium)",
-      "",
-      `**Token Guardrails Active:** ${recentHourLogs.length}/${HOURLY_HARD_CAP} calls used in last 60m · 60s workspace cooldown · 30m exact-match cache · <${TRIVIAL_DIFF_CHANGED_LINES}-line trivial diff skip`,
-    ].join("\n"),
+    text: sections.join("\n"),
   };
 }
