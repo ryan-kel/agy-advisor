@@ -1,0 +1,12 @@
+{
+  "name": "advisor",
+  "displayName": "Cross-Model Advisor",
+  "version": "1.1.0",
+  "description": "Cross-model advisor and verification gate powered by Claude Opus 5.5 (High) and Claude Sonnet 5.5 with automatic complexity gating and token-saving guardrails.",
+  "logo": "assets/logo.svg",
+  "suggestedPrompts": [
+    "Ask the advisor to audit this implementation plan and flag edge cases",
+    "Have the advisor verify the math, sources, and prose track in this draft",
+    "Run a cross-model code review on my current git diff"
+  ]
+}

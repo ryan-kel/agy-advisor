@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" fill="none">
+  <!-- 10% transparent margin baked in: content lives within 28..228 -->
+  <rect x="28" y="28" width="200" height="200" rx="40" fill="#0F172A" stroke="#38BDF8" stroke-width="8"/>
+  <!-- Shield / Verification Crest -->
+  <path d="M128 56L184 80V128C184 166 159 194 128 206C97 194 72 166 72 128V80L128 56Z" fill="#1E293B" stroke="#F59E0B" stroke-width="6" stroke-linejoin="round"/>
+  <!-- Checkmark + Cross-Model Spark -->
+  <path d="M102 132L120 150L156 110" stroke="#38BDF8" stroke-width="10" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="128" cy="86" r="6" fill="#F59E0B"/>
+</svg>

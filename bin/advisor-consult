@@ -1,0 +1,111 @@
+#!/usr/bin/env node
+import fs from "node:fs";
+import { runAdvisorConsult, checkAdvisorQuota } from "../mcp/advisor-core.mjs";
+
+function printHelp() {
+  console.log(`Usage: advisor-consult [options] [prompt | -]
+
+Cross-model advisor CLI powered by Antigravity subscription models
+(smart auto-tiering in strict read-only advisor-engine mode).
+
+Options:
+  --focus <mode>       Review mode: plan | code | prose | math | general (default: general)
+  --tier <preset>      Model preset: auto (default) | deep (Opus 5.5 High) | fast (Sonnet 5.5 High) |
+                       opus-medium | sonnet-medium | gpt-oss | <model-id>
+  --model <model-id>   Alias for --tier
+  --effort <level>     Reasoning effort: low | medium | high | xhigh | max
+  --workspace <dir>    Workspace root directory (default: current directory)
+  --file <path>        Target file to inspect (repeatable)
+  --diff               Include git status and git diff HEAD from workspace
+  --force              Bypass 60s workspace cooldown, trivial-diff skip, and cache
+  --models             List available subscription models and active token guardrails
+  -h, --help           Show this help message
+`);
+}
+
+function requireArgValue(argv, index, flagName) {
+  if (index + 1 >= argv.length || argv[index + 1].startsWith("--")) {
+    throw new Error(`Missing value for ${flagName}`);
+  }
+  return argv[index + 1];
+}
+
+async function main() {
+  const argv = process.argv.slice(2);
+  let focus = "general";
+  let tier = "auto";
+  let effort = undefined;
+  let workspace = process.cwd();
+  const files = [];
+  let includeGitDiff = false;
+  let force = false;
+  let readStdin = false;
+  const promptParts = [];
+
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (arg === "-h" || arg === "--help") {
+      printHelp();
+      process.exit(0);
+    } else if (arg === "--models") {
+      const res = await checkAdvisorQuota();
+      console.log(res.text);
+      process.exit(0);
+    } else if (arg === "--focus") {
+      focus = requireArgValue(argv, i++, "--focus");
+    } else if (arg === "--tier" || arg === "--model") {
+      tier = requireArgValue(argv, i++, arg);
+    } else if (arg === "--effort") {
+      effort = requireArgValue(argv, i++, "--effort");
+    } else if (arg === "--workspace") {
+      workspace = requireArgValue(argv, i++, "--workspace");
+    } else if (arg === "--file") {
+      files.push(requireArgValue(argv, i++, "--file"));
+    } else if (arg === "--diff") {
+      includeGitDiff = true;
+    } else if (arg === "--force") {
+      force = true;
+    } else if (arg === "-") {
+      readStdin = true;
+    } else if (arg === "--") {
+      promptParts.push(...argv.slice(i + 1));
+      break;
+    } else if (arg.startsWith("-")) {
+      throw new Error(`Unknown option: ${arg}`);
+    } else {
+      promptParts.push(arg);
+    }
+  }
+
+  let prompt = promptParts.join(" ").trim();
+  if (!prompt && readStdin) {
+    prompt = fs.readFileSync(0, "utf8").trim();
+  }
+
+  if (!prompt) {
+    printHelp();
+    process.exit(1);
+  }
+
+  const result = await runAdvisorConsult({
+    prompt,
+    focus,
+    tier,
+    effort,
+    workspace,
+    files,
+    includeGitDiff,
+    force,
+  });
+
+  if (result.isError) {
+    console.error(result.text);
+    process.exit(1);
+  }
+  console.log(result.text);
+}
+
+main().catch((err) => {
+  console.error(`Error: ${err.message || err}`);
+  process.exit(1);
+});

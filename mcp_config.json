@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "mcp": {
+      "command": "/usr/bin/env",
+      "args": [
+        "bash",
+        "${PLUGIN_ROOT}/bin/run-mcp-server"
+      ]
+    }
+  }
+}
