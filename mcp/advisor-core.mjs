@@ -167,11 +167,15 @@ async function discoverLsConnection() {
 
   try {
     const candidatePids = new Set([process.ppid]);
-    const pgrepOut = await safeExecAsync("pgrep", ["-f", "language_server"], HOME, 2000);
+    const uid = typeof process.getuid === "function" ? String(process.getuid()) : null;
+    const pgrepArgs = uid
+      ? ["-u", uid, "-f", "language_server"]
+      : ["-f", "language_server"];
+    const pgrepOut = await safeExecAsync("pgrep", pgrepArgs, HOME, 2000);
     if (pgrepOut) {
       for (const p of pgrepOut.split(/\s+/)) {
         const num = Number(p);
-        if (num > 0) candidatePids.add(num);
+        if (num > 0 && num !== process.pid) candidatePids.add(num);
       }
     }
 
@@ -179,21 +183,36 @@ async function discoverLsConnection() {
     const candidates = [];
 
     for (const pid of candidatePids) {
-      const cmdlinePath = `/proc/${pid}/cmdline`;
-      if (!fs.existsSync(cmdlinePath)) continue;
-      const cmdArgs = fs.readFileSync(cmdlinePath, "utf8").split("\0");
-      const csrfIdx = cmdArgs.indexOf("--csrf_token");
-      if (csrfIdx === -1 || !cmdArgs[csrfIdx + 1]) continue;
-      const csrf = cmdArgs[csrfIdx + 1];
+      try {
+        const cmdlinePath = `/proc/${pid}/cmdline`;
+        const cmdArgs = fs.readFileSync(cmdlinePath, "utf8").split("\0");
+        const exeBase = path.basename(cmdArgs[0] || "");
+        if (!exeBase.startsWith("language_server")) continue;
 
-      if (ssOut) {
-        for (const line of ssOut.split("\n")) {
-          if (!line.includes(`pid=${pid},`)) continue;
-          const m = line.match(/127\.0\.0\.1:(\d+)/);
-          if (m) {
-            candidates.push({ lsAddr: `127.0.0.1:${m[1]}`, csrf });
+        let csrf = null;
+        const eqArg = cmdArgs.find((a) => a.startsWith("--csrf_token="));
+        if (eqArg) {
+          csrf = eqArg.slice("--csrf_token=".length);
+        } else {
+          const csrfIdx = cmdArgs.indexOf("--csrf_token");
+          if (csrfIdx !== -1 && cmdArgs[csrfIdx + 1]) {
+            csrf = cmdArgs[csrfIdx + 1];
           }
         }
+        if (!csrf) continue;
+
+        if (ssOut) {
+          const pidRegex = new RegExp(`\\bpid=${pid}[,)]`);
+          for (const line of ssOut.split("\n")) {
+            if (!pidRegex.test(line)) continue;
+            const m = line.match(/127\.0\.0\.1:(\d+)/);
+            if (m) {
+              candidates.push({ lsAddr: `127.0.0.1:${m[1]}`, csrf });
+            }
+          }
+        }
+      } catch {
+        // Ignore exited/unreadable PID and continue
       }
     }
     return candidates;
@@ -202,8 +221,7 @@ async function discoverLsConnection() {
   }
 }
 
-async function queryLiveQuotaPool() {
-  const candidates = await discoverLsConnection();
+async function tryQuotaCandidates(candidates) {
   for (const { lsAddr, csrf } of candidates) {
     try {
       const res = await fetch(
@@ -237,6 +255,17 @@ async function queryLiveQuotaPool() {
     } catch {
       // Try next candidate port
     }
+  }
+  return null;
+}
+
+async function queryLiveQuotaPool() {
+  const hadCache = Boolean(cachedLsConn);
+  const firstResult = await tryQuotaCandidates(await discoverLsConnection());
+  if (firstResult) return firstResult;
+  if (hadCache) {
+    cachedLsConn = null;
+    return tryQuotaCandidates(await discoverLsConnection());
   }
   return null;
 }
@@ -366,6 +395,15 @@ function isUnderSites(p) {
   return /(?:^|\/)(?:dev\/)?sites(?:\/|$)/.test(p);
 }
 
+function clipUtf8(str, maxBytes) {
+  const clean = String(str || "").replace(/\0/g, "");
+  if (Buffer.byteLength(clean, "utf8") <= maxBytes) return clean;
+  const sub = Buffer.from(clean, "utf8").subarray(0, maxBytes);
+  return new TextDecoder("utf-8", { fatal: false })
+    .decode(sub)
+    .replace(/\uFFFD+$/, "");
+}
+
 function countDiffChangedLines(diffText) {
   if (!diffText) return 0;
   let count = 0;
@@ -406,10 +444,10 @@ async function gatherWorkspaceContext({
   for (const filePath of resolvedFiles.slice(0, MAX_ATTACHED_FILES)) {
     try {
       if (fs.existsSync(filePath) && fs.statSync(filePath).isFile()) {
-        const raw = fs.readFileSync(filePath, "utf8");
+        const raw = fs.readFileSync(filePath, "utf8").replace(/\0/g, "");
         const clipped =
           Buffer.byteLength(raw, "utf8") > MAX_FILE_SNIPPET_BYTES
-            ? `${Buffer.from(raw, "utf8").subarray(0, MAX_FILE_SNIPPET_BYTES).toString("utf8")}\n... [truncated at ${fileCapKb} KB]`
+            ? `${clipUtf8(raw, MAX_FILE_SNIPPET_BYTES)}\n... [truncated at ${fileCapKb} KB]`
             : raw;
         contextBlocks.push(
           `## File Content: ${filePath}\n\`\`\`\n${clipped}\n\`\`\``
@@ -458,18 +496,31 @@ async function gatherWorkspaceContext({
       4000
     );
     if (isGitRepo === "true") {
-      let [statusOut, untrackedOut, diffStatOut, diffOut] = await Promise.all([
-        safeExecAsync("git", ["status", "--short"], resolvedWorkspace, 5000),
-        safeExecAsync(
-          "git",
-          ["ls-files", "--others", "--exclude-standard"],
-          resolvedWorkspace,
-          5000
-        ),
-        safeExecAsync("git", ["diff", "--stat", "HEAD"], resolvedWorkspace, 5000),
-        safeExecAsync("git", ["diff", "HEAD"], resolvedWorkspace, 6000),
-      ]);
+      const [statusOut, untrackedOut, rawDiffStatOut, rawDiffOut] =
+        await Promise.all([
+          safeExecAsync("git", ["status", "--short"], resolvedWorkspace, 5000),
+          safeExecAsync(
+            "git",
+            ["ls-files", "--others", "--exclude-standard"],
+            resolvedWorkspace,
+            5000
+          ),
+          safeExecAsync(
+            "git",
+            ["diff", "--no-color", "--no-ext-diff", "--stat", "HEAD"],
+            resolvedWorkspace,
+            10000
+          ),
+          safeExecAsync(
+            "git",
+            ["diff", "--no-color", "--no-ext-diff", "HEAD"],
+            resolvedWorkspace,
+            10000
+          ),
+        ]);
 
+      let diffStatOut = rawDiffStatOut;
+      let diffOut = rawDiffOut;
       let diffLabel = "git diff HEAD";
       // If working tree has no tracked modifications (e.g. right after git commit or git pull),
       // automatically fall back to the latest commit (`git show HEAD`) so --diff still has real context.
@@ -477,15 +528,15 @@ async function gatherWorkspaceContext({
         const [headStatOut, headDiffOut] = await Promise.all([
           safeExecAsync(
             "git",
-            ["show", "--stat", "--format=oneline", "HEAD"],
+            ["show", "--no-color", "--no-ext-diff", "--stat", "--format=oneline", "HEAD"],
             resolvedWorkspace,
-            5000
+            10000
           ),
           safeExecAsync(
             "git",
-            ["show", "--format=oneline", "HEAD"],
+            ["show", "--no-color", "--no-ext-diff", "--format=oneline", "HEAD"],
             resolvedWorkspace,
-            6000
+            10000
           ),
         ]);
         if (headDiffOut) {
@@ -517,8 +568,8 @@ async function gatherWorkspaceContext({
         const diffCapKb = Math.round(MAX_DIFF_BYTES / 1000);
         const clippedDiff =
           Buffer.byteLength(gitDiff, "utf8") > MAX_DIFF_BYTES
-            ? `${Buffer.from(gitDiff, "utf8").subarray(0, MAX_DIFF_BYTES).toString("utf8")}\n... [diff truncated at ${diffCapKb} KB]`
-            : gitDiff;
+            ? `${clipUtf8(gitDiff, MAX_DIFF_BYTES)}\n... [diff truncated at ${diffCapKb} KB]`
+            : gitDiff.replace(/\0/g, "");
         contextBlocks.push(
           [`## Git Diff Preview (${diffLabel})`, "```diff", clippedDiff, "```"].join(
             "\n"
@@ -546,13 +597,17 @@ function buildAdvisorPrompt({
   resolvedWorkspace,
   contextBlocks,
 }) {
+  const safeUserPrompt = clipUtf8(
+    String(prompt || "").trim(),
+    MAX_PROMPT_BYTES - 2048
+  );
   const coreSections = [
     "[ADVISOR REVIEW REQUEST — 1-SHOT MODE]",
     `Review Focus: ${focusKey.toUpperCase()} | Workspace: ${resolvedWorkspace}`,
     FOCUS_INSTRUCTIONS[focusKey],
     "",
     "## Task / Material Under Review",
-    String(prompt || "").trim(),
+    safeUserPrompt,
     "",
     "## Required Output Format",
     "1. **Verdict**: `APPROVE`, `REVISE`, or `BLOCK` (1 sentence).",
@@ -560,14 +615,11 @@ function buildAdvisorPrompt({
     "3. **Concrete Fixes**: Specific changes required.",
   ];
 
-  let text = coreSections.join("\n");
-  if (Buffer.byteLength(text, "utf8") > MAX_PROMPT_BYTES) {
-    const buf = Buffer.from(text, "utf8").subarray(0, MAX_PROMPT_BYTES - 128);
-    return buf.toString("utf8") + "\n\n[Prompt truncated to fit byte budget.]";
-  }
+  let text = coreSections.join("\n").replace(/\0/g, "");
 
   for (const block of contextBlocks) {
-    const candidate = `${text}\n\n${block}`;
+    const cleanBlock = String(block || "").replace(/\0/g, "");
+    const candidate = `${text}\n\n${cleanBlock}`;
     if (Buffer.byteLength(candidate, "utf8") > MAX_PROMPT_BYTES) {
       text += "\n\n[Additional context omitted to conserve token quota.]";
       break;
@@ -740,15 +792,24 @@ export async function runAdvisorConsult({
   const startTime = Date.now();
 
   return new Promise((resolve) => {
-    const child = spawn(AGY_BIN, args, {
-      cwd: fs.existsSync(ctx.resolvedWorkspace) ? ctx.resolvedWorkspace : HOME,
-      env: {
-        ...process.env,
-        AGY_ADVISOR_ACTIVE: "1",
-        PATH: `${path.join(HOME, ".local/bin")}:/usr/local/bin:/usr/bin:/bin:${process.env.PATH || ""}`,
-      },
-      stdio: ["ignore", "pipe", "pipe"],
-    });
+    let child;
+    try {
+      child = spawn(AGY_BIN, args, {
+        cwd: fs.existsSync(ctx.resolvedWorkspace) ? ctx.resolvedWorkspace : HOME,
+        env: {
+          ...process.env,
+          AGY_ADVISOR_ACTIVE: "1",
+          PATH: `${path.join(HOME, ".local/bin")}:/usr/local/bin:/usr/bin:/bin:${process.env.PATH || ""}`,
+        },
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+    } catch (err) {
+      resolve({
+        isError: true,
+        text: `Failed to spawn agy (${AGY_BIN}): ${err.message}`,
+      });
+      return;
+    }
 
     child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
