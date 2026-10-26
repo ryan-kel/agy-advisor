@@ -38,12 +38,12 @@ Before calling the advisor, run deterministic local checks so you never waste su
 
 Leave `--tier auto` (the default) unless a specific model is requested:
 
-| Checkpoint | `--focus` | Auto-Selected Model | Built-in Token Guard |
+| Checkpoint | `--focus` | Auto-Selected Model (1-Shot Mode) | Built-in Token Guard |
 | --- | --- | --- | --- |
-| **Implementation / Architecture Plan** | `plan` | `claude-opus-5-5-high` (`high`) | 30m exact-match cache + 60s workspace cooldown |
-| **Quantitative / Data / SQL Claims** | `math` | `claude-opus-5-5-high` (`high`) | 30m exact-match cache + 60s workspace cooldown |
-| **Long-Form Prose / Specs** | `prose` | `claude-opus-5-5-high` (`high`) | Auto-attaches `ea-lint.mjs` (if present) + 60s cooldown |
-| **Multi-File Code Changes / Bugfixes** | `code` | `claude-sonnet-5-5-medium` (<150 lines) or `claude-sonnet-5-5-high` (>=150 lines) | Skips automatically (`0 tokens`) if diff is <12 lines with no untracked files |
+| **Implementation / Architecture Plan** | `plan` | `claude-sonnet-5-5-medium` (`medium`) | 60m exact-match cache + 120s workspace cooldown + 35% quota floor |
+| **Multi-File Code Changes / Bugfixes** | `code` | `claude-sonnet-5-5-medium` (`medium`) | Skips automatically (`0 tokens`) if diff is <20 lines; falls back to `git show HEAD` when clean |
+| **Quantitative / Data / SQL Claims** | `math` | `claude-sonnet-5-5-high` (`high`) | 60m exact-match cache + 120s workspace cooldown + 35% quota floor |
+| **Long-Form Prose / Specs** | `prose` | `claude-sonnet-5-5-high` (`high`) | Auto-attaches `ea-lint.mjs` (if present) + 120s workspace cooldown |
 
 ## 4. Act on the Verdict (Max 1 Call Per Turn)
 

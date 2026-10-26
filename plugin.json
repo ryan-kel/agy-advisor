@@ -1,8 +1,8 @@
 {
   "name": "advisor",
   "displayName": "Cross-Model Advisor",
-  "version": "1.1.0",
-  "description": "Cross-model advisor and verification gate powered by Claude Opus 5.5 (High) and Claude Sonnet 5.5 with automatic complexity gating and token-saving guardrails.",
+  "version": "1.2.0",
+  "description": "1-shot cross-model advisor and verification gate powered by Claude Sonnet 5.5 and Claude Opus 5.5 with live quota telemetry, automatic complexity gating, and token-saving guardrails.",
   "logo": "assets/logo.svg",
   "suggestedPrompts": [
     "Ask the advisor to audit this implementation plan and flag edge cases",

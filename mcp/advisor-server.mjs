@@ -4,7 +4,7 @@ import { runAdvisorConsult, checkAdvisorQuota } from "./advisor-core.mjs";
 
 const SERVER_INFO = {
   name: "advisor-mcp",
-  version: "1.1.0",
+  version: "1.2.0",
 };
 
 const SUPPORTED_PROTOCOLS = new Set(["2025-03-26", "2024-11-05"]);
@@ -14,7 +14,7 @@ const TOOLS = [
   {
     name: "consult_advisor",
     description:
-      "Consult the cross-model advisor in read-only mode to audit implementation plans, code diffs, quantitative/data claims, or prose/documentation. Uses smart auto-tiering by default (Claude Opus 5.5 High for plans/math/prose; Claude Sonnet 5.5 for code) with built-in token-saving guards.",
+      "Consult the cross-model advisor in 1-shot read-only mode to audit implementation plans, code diffs, quantitative/data claims, or prose/documentation. Uses smart auto-tiering by default (Claude Sonnet 5.5 Medium for code/plan/general; Claude Sonnet 5.5 High for math/prose) with live quota telemetry and token-saving guards.",
     _meta: {
       "antigravity/alwaysLoad": true,
     },
@@ -45,7 +45,7 @@ const TOOLS = [
             "gpt-oss",
           ],
           description:
-            "Advisor model tier: 'auto' (default, routes plan/math/prose to Claude Opus 5.5 High and code to Claude Sonnet 5.5), 'deep' (force Claude Opus 5.5 High), or 'fast' (Claude Sonnet 5.5 High).",
+            "Advisor model tier: 'auto' (default, 1-shot Claude Sonnet 5.5 Medium for code/plan/general and High for math/prose), 'deep' (Claude Opus 5.5 Medium), 'opus-high' (Claude Opus 5.5 High), or 'fast' (Claude Sonnet 5.5 Medium).",
         },
         workspace: {
           type: "string",
@@ -56,17 +56,17 @@ const TOOLS = [
           type: "array",
           items: { type: "string" },
           description:
-            "Optional list of specific file paths for the advisor to read and verify.",
+            "Optional list of specific file paths (up to 8 files, 24 KB each) for the advisor to read and verify.",
         },
         include_git_diff: {
           type: "boolean",
           description:
-            "Set true to automatically attach `git status --short` and `git diff HEAD` from the workspace.",
+            "Set true to automatically attach `git status --short` and `git diff HEAD` (or `git show HEAD` if working tree is clean) from the workspace.",
         },
         force: {
           type: "boolean",
           description:
-            "Set true only when the user explicitly requests an advisor review and wants to bypass the 60s cooldown or trivial-diff skip.",
+            "Set true only when the user explicitly requests an advisor review and wants to bypass the 120s cooldown, 35% quota floor, cache, or trivial-diff skip.",
         },
       },
       required: ["prompt"],
