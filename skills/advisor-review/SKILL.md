@@ -21,7 +21,7 @@ Before calling the advisor, run deterministic local checks so you never waste su
 ## 2. Choose the Invocation Path
 
 1. **MCP Tool (`consult_advisor` / `advisor_mcp_consult_advisor`)** — Preferred when loaded:
-   - Pass `prompt`, `focus` (`plan` | `code` | `prose` | `math` | `general`), `tier` (`auto` | `deep` | `fast`), `workspace`, `files`, `include_git_diff`, and `force` (true only when the user explicitly requests a review).
+   - Pass `prompt`, `focus` (`plan` | `code` | `prose` | `math` | `general`), `tier` (`auto` | `deep` | `fast`), `workspace`, `files`, and `include_git_diff`.
 2. **CLI Helper (`advisor-consult`)** — Always available via `run_command`:
    ```bash
    ~/.gemini/config/plugins/advisor/bin/advisor-consult \
@@ -34,18 +34,18 @@ Before calling the advisor, run deterministic local checks so you never waste su
    ```
 3. **Background Subagent (`invoke_subagent` with `TypeName: "advisor"`)** — Best for async parallel audits.
 
-## 3. Smart Auto-Tiering & Token Guards
+## 3. Smart Auto-Tiering (No Rate Limits or Cooldowns)
 
-Leave `--tier auto` (the default) unless a specific model is requested:
+Leave `--tier auto` (the default) unless a specific model is requested. There are **no hourly caps, cooldowns, or rate limits** — run the advisor whenever requested or needed:
 
-| Checkpoint | `--focus` | Auto-Selected Model (1-Shot Mode) | Built-in Token Guard |
+| Checkpoint | `--focus` | Auto-Selected Model (1-Shot Mode) | Context Attached Automatically |
 | --- | --- | --- | --- |
-| **Implementation / Architecture Plan** | `plan` | `claude-sonnet-5-5-medium` (`medium`) | 60m exact-match cache + 120s workspace cooldown + 35% quota floor |
-| **Multi-File Code Changes / Bugfixes** | `code` | `claude-sonnet-5-5-medium` (`medium`) | Skips automatically (`0 tokens`) if diff is <20 lines; falls back to `git show HEAD` when clean |
-| **Quantitative / Data / SQL Claims** | `math` | `claude-sonnet-5-5-high` (`high`) | 60m exact-match cache + 120s workspace cooldown + 35% quota floor |
-| **Long-Form Prose / Specs** | `prose` | `claude-sonnet-5-5-high` (`high`) | Auto-attaches `ea-lint.mjs` (if present) + 120s workspace cooldown |
+| **Implementation / Architecture Plan** | `plan` | `claude-sonnet-5-5-medium` (`medium`) | Target files (up to 8 files, 24 KB each) |
+| **Multi-File Code Changes / Bugfixes** | `code` | `claude-sonnet-5-5-medium` (`medium`) | `git status`, `git diff HEAD` (or `git show HEAD` if clean), and target files |
+| **Quantitative / Data / SQL Claims** | `math` | `claude-sonnet-5-5-high` (`high`) | Target files and calculations |
+| **Long-Form Prose / Specs** | `prose` | `claude-sonnet-5-5-high` (`high`) | Auto-attaches `ea-lint.mjs` output (if present) and target files |
 
-## 4. Act on the Verdict (Max 1 Call Per Turn)
+## 4. Act on the Verdict
 
 - **`APPROVE`**: Present the final result to the user.
-- **`REVISE` or `BLOCK`**: Fix every verified defect or style violation and re-verify locally inside the same turn. Do **not** re-poll the advisor in a loop after applying its fixes.
+- **`REVISE` or `BLOCK`**: Fix every verified defect or style violation and re-verify locally. You may re-run the advisor whenever you or the user want another pass.

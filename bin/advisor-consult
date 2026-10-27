@@ -6,7 +6,7 @@ function printHelp() {
   console.log(`Usage: advisor-consult [options] [prompt | -]
 
 Cross-model advisor CLI powered by Antigravity subscription models
-(1-shot zero-tool mode with live quota tracking and anti-burner guards).
+(1-shot zero-tool mode with live quota tracking and no rate limits).
 
 Options:
   --status, --models   Show live subscription quota %, recent advisor call log, and tiers
@@ -18,7 +18,7 @@ Options:
   --workspace <dir>    Workspace root directory (default: current directory)
   --file <path>        Target file to attach and inspect (repeatable)
   --diff               Include git status and git diff HEAD from workspace
-  --force              Bypass 120s cooldown, 35% quota floor, trivial-diff skip, and cache
+  --force              Optional compatibility flag (no rate limits or cooldowns are enforced)
   -h, --help           Show this help message
 `);
 }

@@ -1,20 +1,55 @@
 #!/usr/bin/env node
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import readline from "node:readline";
-import { runAdvisorConsult, checkAdvisorQuota } from "./advisor-core.mjs";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const SERVER_INFO = {
   name: "advisor-mcp",
-  version: "1.2.0",
+  version: "1.3.0",
 };
 
 const SUPPORTED_PROTOCOLS = new Set(["2025-03-26", "2024-11-05"]);
 const inflight = new Map();
 
+let cachedCoreModule = null;
+let cachedCoreMtimeMs = 0;
+
+async function loadAdvisorCore() {
+  const localCore = path.join(
+    path.dirname(fileURLToPath(import.meta.url)),
+    "advisor-core.mjs"
+  );
+  const installedCore = path.join(
+    os.homedir(),
+    ".gemini/config/plugins/advisor/mcp/advisor-core.mjs"
+  );
+  const targetPath = fs.existsSync(localCore) ? localCore : installedCore;
+  try {
+    const stat = fs.statSync(targetPath);
+    if (!cachedCoreModule || stat.mtimeMs !== cachedCoreMtimeMs) {
+      const mod = await import(
+        `${pathToFileURL(targetPath).href}?v=${stat.mtimeMs}`
+      );
+      cachedCoreModule = mod;
+      cachedCoreMtimeMs = stat.mtimeMs;
+    }
+    return cachedCoreModule;
+  } catch (err) {
+    process.stderr.write(
+      `[advisor-mcp] reload failed: ${err.message || err}\n`
+    );
+    if (cachedCoreModule) return cachedCoreModule;
+    return import("./advisor-core.mjs");
+  }
+}
+
 const TOOLS = [
   {
     name: "consult_advisor",
     description:
-      "Consult the cross-model advisor in 1-shot read-only mode to audit implementation plans, code diffs, quantitative/data claims, or prose/documentation. Uses smart auto-tiering by default (Claude Sonnet 5.5 Medium for code/plan/general; Claude Sonnet 5.5 High for math/prose) with live quota telemetry and token-saving guards.",
+      "Consult the cross-model advisor in 1-shot read-only mode to audit implementation plans, code diffs, quantitative/data claims, or prose/documentation. Uses smart auto-tiering by default (Claude Sonnet 5.5 Medium for code/plan/general; Claude Sonnet 5.5 High for math/prose) with live quota telemetry and no rate limits or cooldowns.",
     _meta: {
       "antigravity/alwaysLoad": true,
     },
@@ -66,7 +101,7 @@ const TOOLS = [
         force: {
           type: "boolean",
           description:
-            "Set true only when the user explicitly requests an advisor review and wants to bypass the 120s cooldown, 35% quota floor, cache, or trivial-diff skip.",
+            "Optional compatibility flag (no rate limits or cooldowns are enforced).",
         },
       },
       required: ["prompt"],
@@ -75,7 +110,7 @@ const TOOLS = [
   {
     name: "check_advisor_quota",
     description:
-      "List available cross-model advisor models in the user's Antigravity subscription and show configured model tiers and active token guardrails.",
+      "List available cross-model advisor models in the user's Antigravity subscription and show configured model tiers and live quota status.",
     _meta: {
       "antigravity/alwaysLoad": true,
     },
@@ -165,6 +200,7 @@ async function handleRequest(req) {
     const args = (params && params.arguments) || {};
 
     if (toolName === "check_advisor_quota") {
+      const { checkAdvisorQuota } = await loadAdvisorCore();
       const res = await checkAdvisorQuota();
       sendResult(id, {
         content: [{ type: "text", text: res.text }],
@@ -174,6 +210,7 @@ async function handleRequest(req) {
     }
 
     if (toolName === "consult_advisor") {
+      const { runAdvisorConsult } = await loadAdvisorCore();
       const controller = new AbortController();
       if (id !== undefined) {
         inflight.set(id, controller);

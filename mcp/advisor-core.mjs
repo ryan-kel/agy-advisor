@@ -1,5 +1,4 @@
 import { spawn, execFile } from "node:child_process";
-import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -22,12 +21,6 @@ const MAX_FILE_SNIPPET_BYTES = 24_000;
 const MAX_ATTACHED_FILES = 8;
 const MAX_DIFF_BYTES = 32_000;
 const EXEC_MAX_BUFFER = 16 * 1024 * 1024;
-
-// Strict Anti-Token-Burner Guardrails
-const COOLDOWN_MS = 120 * 1000; // 2m minimum between automatic calls in the same workspace
-const CACHE_TTL_MS = 60 * 60 * 1000; // 60m exact-match deduplication cache
-const QUOTA_FLOOR_FRACTION = 0.35; // Never run automatic advisor calls if Claude quota < 35%
-const TRIVIAL_DIFF_CHANGED_LINES = 20; // Skip automatic code diff review if <20 changed lines
 
 export const TIER_PRESETS = {
   deep: {
@@ -281,45 +274,6 @@ function sendDesktopToast(title, body) {
   }
 }
 
-function checkResponseCache(cacheKey) {
-  try {
-    const cachePath = path.join(getDataDir(), "advisor-cache.json");
-    if (!fs.existsSync(cachePath)) return null;
-    const cache = JSON.parse(fs.readFileSync(cachePath, "utf8"));
-    const hit = cache[cacheKey];
-    if (hit && Date.now() - hit.ts <= CACHE_TTL_MS) {
-      return hit.text;
-    }
-    return null;
-  } catch {
-    return null;
-  }
-}
-
-function writeResponseCache(cacheKey, text) {
-  try {
-    const cachePath = path.join(getDataDir(), "advisor-cache.json");
-    let cache = {};
-    if (fs.existsSync(cachePath)) {
-      try {
-        cache = JSON.parse(fs.readFileSync(cachePath, "utf8")) || {};
-      } catch {
-        cache = {};
-      }
-    }
-    const now = Date.now();
-    const entries = Object.entries(cache)
-      .filter(([, v]) => v && now - v.ts <= CACHE_TTL_MS)
-      .sort((a, b) => b[1].ts - a[1].ts)
-      .slice(0, 19);
-    const nextCache = Object.fromEntries(entries);
-    nextCache[cacheKey] = { ts: now, text };
-    fs.writeFileSync(cachePath, JSON.stringify(nextCache, null, 2), "utf8");
-  } catch {
-    // Ignore cache write errors
-  }
-}
-
 function resolveTierAndModel(
   tierOrModel = "auto",
   explicitEffort,
@@ -396,20 +350,6 @@ function clipUtf8(str, maxBytes) {
     .replace(/\uFFFD+$/, "");
 }
 
-function countDiffChangedLines(diffText) {
-  if (!diffText) return 0;
-  let count = 0;
-  for (const line of diffText.split("\n")) {
-    if (
-      (line.startsWith("+") && !line.startsWith("+++")) ||
-      (line.startsWith("-") && !line.startsWith("---"))
-    ) {
-      count++;
-    }
-  }
-  return count;
-}
-
 async function gatherWorkspaceContext({
   focus = "general",
   workspace,
@@ -429,7 +369,6 @@ async function gatherWorkspaceContext({
   let gitDiff = "";
   let gitStatus = "";
   let gitUntracked = "";
-  let changedLineCount = null;
 
   // Attach target file snippets directly in Node.js (0 model tool turns needed)
   const fileCapKb = Math.round(MAX_FILE_SNIPPET_BYTES / 1000);
@@ -541,7 +480,6 @@ async function gatherWorkspaceContext({
       gitStatus = statusOut || "";
       gitUntracked = untrackedOut || "";
       gitDiff = diffOut || "";
-      changedLineCount = countDiffChangedLines(gitDiff);
 
       const stateLines = [
         "## Workspace Git State",
@@ -576,10 +514,6 @@ async function gatherWorkspaceContext({
     resolvedWorkspace,
     resolvedFiles,
     contextBlocks,
-    gitStatus,
-    gitUntracked,
-    gitDiff,
-    changedLineCount,
   };
 }
 
@@ -657,90 +591,21 @@ export async function runAdvisorConsult({
     };
   }
 
-  const ctx = await gatherWorkspaceContext({
-    focus,
-    workspace,
-    files,
-    includeGitDiff,
-  });
-
-  // Token Guard 1: Trivial Diff Skip Gate (0 tokens spent)
-  if (
-    !force &&
-    ctx.focusKey === "code" &&
-    includeGitDiff &&
-    ctx.changedLineCount !== null &&
-    ctx.changedLineCount < TRIVIAL_DIFF_CHANGED_LINES &&
-    !ctx.gitUntracked &&
-    files.length <= 1
-  ) {
-    return {
-      isError: false,
-      text: `> [!NOTE] **Advisor Skipped (0 tokens used)** — Diff in \`${ctx.resolvedWorkspace}\` has ${ctx.changedLineCount} changed line(s) (<${TRIVIAL_DIFF_CHANGED_LINES}-line threshold).`,
-    };
-  }
-
-  // Token Guard 2: Live Quota Floor Check (<35% remaining skips automatic calls)
-  const preQuota = await queryLiveQuotaPool();
-  if (
-    !force &&
-    preQuota &&
-    typeof preQuota.claudeRemaining === "number" &&
-    preQuota.claudeRemaining < QUOTA_FLOOR_FRACTION
-  ) {
-    const pct = (preQuota.claudeRemaining * 100).toFixed(1);
-    return {
-      isError: false,
-      text: `> [!WARNING] **Advisor Quota Guard (0 tokens used)** — Claude subscription pool is at ${pct}% (<${QUOTA_FLOOR_FRACTION * 100}% floor). Skipping automatic advisor call to preserve your quota. Pass \`--force\` to override.`,
-    };
-  }
-
-  // Check recent call history for per-workspace cooldown
-  const recentHourLogs = readRecentLogs(60 * 60 * 1000);
+  const [ctx, preQuota] = await Promise.all([
+    gatherWorkspaceContext({
+      focus,
+      workspace,
+      files,
+      includeGitDiff,
+    }),
+    queryLiveQuotaPool(),
+  ]);
 
   const { model, effort: resolvedEffort, label } = resolveTierAndModel(
     tier,
     effort,
     ctx.focusKey
   );
-
-  // Token Guard 4: Exact-Match Deduplication Cache (0 tokens spent)
-  const cacheKey = crypto
-    .createHash("sha256")
-    .update(
-      JSON.stringify({
-        model,
-        focus: ctx.focusKey,
-        workspace: ctx.resolvedWorkspace,
-        files: ctx.resolvedFiles,
-        prompt: String(prompt).trim(),
-        gitStatus: ctx.gitStatus,
-        gitDiff: ctx.gitDiff,
-      })
-    )
-    .digest("hex");
-
-  if (!force) {
-    const cachedText = checkResponseCache(cacheKey);
-    if (cachedText) {
-      return {
-        isError: false,
-        text: `${cachedText}\n\n*(Served from 60m deduplication cache — 0 additional tokens used.)*`,
-      };
-    }
-
-    // Token Guard 5: Per-Workspace Cooldown (120s)
-    const lastWorkspaceCall = [...recentHourLogs]
-      .reverse()
-      .find((entry) => entry.workspace === ctx.resolvedWorkspace);
-    if (lastWorkspaceCall && Date.now() - lastWorkspaceCall.ts < COOLDOWN_MS) {
-      const agoSec = Math.round((Date.now() - lastWorkspaceCall.ts) / 1000);
-      return {
-        isError: false,
-        text: `> [!NOTE] **Advisor Cooldown Active (0 tokens used)** — Audited \`${ctx.resolvedWorkspace}\` ${agoSec}s ago (cooldown: ${COOLDOWN_MS / 1000}s). Apply previous feedback without re-polling.`,
-      };
-    }
-  }
 
   const fullPrompt = buildAdvisorPrompt({
     prompt,
@@ -929,7 +794,6 @@ export async function runAdvisorConsult({
       ].join("\n");
 
       const fullResponse = `${banner}\n\n${cleanOut}`;
-      writeResponseCache(cacheKey, fullResponse);
       resolve({
         isError: false,
         text: fullResponse,
@@ -975,7 +839,7 @@ export async function checkAdvisorQuota() {
   sections.push(
     "",
     "### 2. Recent Advisor Calls (What Used Your Tokens)",
-    `Calls in last 60 minutes: **${recentHourLogs.length}** (No hourly cap; live floor guard stops automatic calls below ${QUOTA_FLOOR_FRACTION * 100}% quota)`
+    `Calls in last 60 minutes: **${recentHourLogs.length}** (No hourly caps, cooldowns, or rate limits)`
   );
 
   if (allRecentLogs.length === 0) {
