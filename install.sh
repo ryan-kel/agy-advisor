@@ -29,11 +29,9 @@ ln -sf "$DEST_DIR/bin/advisor-consult" "$BIN_DIR/advisor-consult"
 
 if command -v agy >/dev/null 2>&1; then
   agy plugin validate "$DEST_DIR" --strict
-  agy plugin disable advisor 2>/dev/null || true
   agy plugin enable advisor 2>/dev/null || true
 elif [[ -x "$HOME/.local/bin/agy" ]]; then
   "$HOME/.local/bin/agy" plugin validate "$DEST_DIR" --strict
-  "$HOME/.local/bin/agy" plugin disable advisor 2>/dev/null || true
   "$HOME/.local/bin/agy" plugin enable advisor 2>/dev/null || true
 fi
 
