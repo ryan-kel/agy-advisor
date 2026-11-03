@@ -7,7 +7,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 const SERVER_INFO = {
   name: "advisor-mcp",
-  version: "1.3.0",
+  version: "1.5.0",
 };
 
 const SUPPORTED_PROTOCOLS = new Set(["2025-03-26", "2024-11-05"]);
@@ -28,12 +28,21 @@ async function loadAdvisorCore() {
   const targetPath = fs.existsSync(localCore) ? localCore : installedCore;
   try {
     const stat = fs.statSync(targetPath);
-    if (!cachedCoreModule || stat.mtimeMs !== cachedCoreMtimeMs) {
+    // Avoid importing a file mid-write if it was modified within the last 150ms
+    if (
+      cachedCoreModule &&
+      stat.mtimeMs !== cachedCoreMtimeMs &&
+      Date.now() - stat.mtimeMs < 150
+    ) {
+      await new Promise((r) => setTimeout(r, 150));
+    }
+    const freshStat = fs.statSync(targetPath);
+    if (!cachedCoreModule || freshStat.mtimeMs !== cachedCoreMtimeMs) {
       const mod = await import(
-        `${pathToFileURL(targetPath).href}?v=${stat.mtimeMs}`
+        `${pathToFileURL(targetPath).href}?v=${freshStat.mtimeMs}`
       );
       cachedCoreModule = mod;
-      cachedCoreMtimeMs = stat.mtimeMs;
+      cachedCoreMtimeMs = freshStat.mtimeMs;
     }
     return cachedCoreModule;
   } catch (err) {
@@ -49,7 +58,7 @@ const TOOLS = [
   {
     name: "consult_advisor",
     description:
-      "Consult the cross-model advisor in 1-shot read-only mode to audit implementation plans, code diffs, quantitative/data claims, or prose/documentation. Uses smart auto-tiering by default (Claude Sonnet 5.5 Medium for code/plan/general; Claude Sonnet 5.5 High for math/prose) with live quota telemetry and no rate limits or cooldowns.",
+      "Consult the cross-model Goldfish advisor in 1-shot read-only mode to audit implementation plans, code diffs, quantitative/data claims, prose/documentation, or doc-to-code drift. Uses smart auto-tiering by default (Claude Sonnet 5.5 Medium for code/plan/drift/general; Claude Sonnet 5.5 High for math/prose) with [Blocker | Major | Nit] verdict calibration, live 5h/weekly quota telemetry, and no rate limits or cooldowns.",
     _meta: {
       "antigravity/alwaysLoad": true,
     },
@@ -63,24 +72,34 @@ const TOOLS = [
         },
         focus: {
           type: "string",
-          enum: ["plan", "code", "prose", "math", "general"],
+          enum: ["plan", "code", "prose", "math", "drift", "general"],
           description:
-            "Review focus mode: 'plan' for architecture/implementation plans, 'code' for code changes/diffs, 'prose' for essays/docs/specs, 'math' for quantitative/source audits, 'general' for second opinions.",
+            "Review focus mode: 'plan' for 4-lens EGM spec/architecture audits, 'code' for code changes/diffs, 'prose' for essays/docs, 'math' for quantitative/source audits, 'drift' for doc-vs-code drift checks, 'general' for second opinions.",
         },
         tier: {
           type: "string",
           enum: [
             "auto",
             "deep",
-            "fast",
             "opus-high",
+            "opus",
             "opus-medium",
+            "opus-low",
+            "fast",
+            "sonnet",
             "sonnet-high",
             "sonnet-medium",
+            "sonnet-low",
             "gpt-oss",
           ],
           description:
-            "Advisor model tier: 'auto' (default, 1-shot Claude Sonnet 5.5 Medium for code/plan/general and High for math/prose), 'deep' (Claude Opus 5.5 Medium), 'opus-high' (Claude Opus 5.5 High), or 'fast' (Claude Sonnet 5.5 Medium).",
+            "Advisor model tier: 'auto' (default, 1-shot Claude Sonnet 5.5 Medium for code/plan/drift/general and High for math/prose), 'deep'/'opus'/'opus-medium' (Claude Opus 5.5 Medium), 'opus-high' (Claude Opus 5.5 High), 'opus-low' (Claude Opus 5.5 Low), 'fast'/'sonnet'/'sonnet-medium' (Claude Sonnet 5.5 Medium), 'sonnet-high' (Claude Sonnet 5.5 High), 'sonnet-low' (Claude Sonnet 5.5 Low), or 'gpt-oss' (GPT-OSS 120B Medium).",
+        },
+        effort: {
+          type: "string",
+          enum: ["low", "medium", "high", "xhigh", "max"],
+          description:
+            "Optional reasoning effort override ('low', 'medium', 'high', 'xhigh', 'max'). Defaults to the selected tier's preset.",
         },
         workspace: {
           type: "string",
@@ -91,12 +110,12 @@ const TOOLS = [
           type: "array",
           items: { type: "string" },
           description:
-            "Optional list of specific file paths (up to 8 files, 24 KB each) for the advisor to read and verify.",
+            "Optional list of specific file paths (up to 8 files, 24 KB each; supports optional 'path:startLine-endLine', 'path#Lstart-Lend', or single-line 'path:line' slicing) for the advisor to read and verify.",
         },
         include_git_diff: {
           type: "boolean",
           description:
-            "Set true to automatically attach `git status --short` and `git diff HEAD` (or `git show HEAD` if working tree is clean) from the workspace.",
+            "Set true to automatically attach `git status --short` and `git diff HEAD` (or `git show HEAD` when there are no uncommitted tracked changes) from the workspace.",
         },
         force: {
           type: "boolean",
@@ -110,7 +129,7 @@ const TOOLS = [
   {
     name: "check_advisor_quota",
     description:
-      "List available cross-model advisor models in the user's Antigravity subscription and show configured model tiers and live quota status.",
+      "List available cross-model advisor models in the user's Antigravity subscription and show configured model tiers and live 5-hour + weekly quota status.",
     _meta: {
       "antigravity/alwaysLoad": true,
     },
@@ -220,6 +239,7 @@ async function handleRequest(req) {
           prompt: args.prompt,
           focus: args.focus || "general",
           tier: args.tier || "auto",
+          effort: args.effort,
           workspace: args.workspace,
           files: Array.isArray(args.files) ? args.files : [],
           includeGitDiff: Boolean(args.include_git_diff),
@@ -249,6 +269,9 @@ async function handleRequest(req) {
   }
 }
 
+let activeHandlers = 0;
+let stdinClosed = false;
+
 const rl = readline.createInterface({
   input: process.stdin,
   terminal: false,
@@ -259,14 +282,27 @@ rl.on("line", (line) => {
   if (!trimmed) return;
   try {
     const parsed = JSON.parse(trimmed);
-    handleRequest(parsed).catch((err) => {
-      if (parsed && parsed.id !== undefined) {
-        sendError(parsed.id, -32603, err.message || "Internal error");
-      }
-    });
+    activeHandlers++;
+    handleRequest(parsed)
+      .catch((err) => {
+        if (parsed && parsed.id !== undefined) {
+          sendError(parsed.id, -32603, err.message || "Internal error");
+        }
+      })
+      .finally(() => {
+        activeHandlers--;
+        if (stdinClosed && activeHandlers === 0) {
+          abortAllAndExit();
+        }
+      });
   } catch {
     // Ignore non-JSON lines
   }
 });
 
-rl.on("close", abortAllAndExit);
+rl.on("close", () => {
+  stdinClosed = true;
+  if (activeHandlers === 0) {
+    abortAllAndExit();
+  }
+});

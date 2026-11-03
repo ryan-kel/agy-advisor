@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
-export PATH="$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin:${PATH:-}"
+export PATH="/usr/local/bin:/usr/bin:/bin:$HOME/opt/node/bin:$HOME/.local/bin:${PATH:-}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+if [[ -x "$HOME/opt/node/bin/node" ]]; then
+  exec "$HOME/opt/node/bin/node" "$SCRIPT_DIR/mcp/advisor-server.mjs" "$@"
+fi
 exec node "$SCRIPT_DIR/mcp/advisor-server.mjs" "$@"
