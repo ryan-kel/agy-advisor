@@ -1,8 +1,17 @@
 #!/usr/bin/env node
 import fs from "node:fs";
+import path from "node:path";
 import {
   runAdvisorConsult,
   checkAdvisorQuota,
+  getDataDir,
+  isSensitiveFilePath,
+  resetEmissionState,
+  dumpAdvisorTranscript,
+  loadWatchdogRuntimeSettings,
+  saveWatchdogRuntimeSettings,
+  discoverWatchdogMarkdownFiles,
+  discoverWatchdogRoster,
   TIER_NAMES,
   FOCUS_MODES,
   EFFORT_LEVELS,
@@ -11,25 +20,37 @@ import {
 function printHelp() {
   console.log(`Usage: advisor-consult [options] [prompt | -]
 
-Cross-model Goldfish advisor CLI powered by Antigravity subscription models
-(1-shot zero-tool mode with [Blocker | Major | Nit] calibration, live quota tracking, and no rate limits).
+Cross-model Goldfish & OMP Watchdog advisor CLI powered by Antigravity subscription models
+(1-shot zero-tool mode with [Blocker | Concern | Nit] calibration, AdvisorEmissionGuard NFKC deduplication,
+WATCHDOG.md / WATCHDOG.yml discovery, live quota tracking, and no rate limits).
 
 Options:
-  --status, --models, --log   Show live subscription quota %, recent advisor call log, and tiers
+  --status, --models, --log   Show live subscription quota %, Watchdog/EmissionGuard state, and recent call log
   --focus <mode>              Review mode: ${FOCUS_MODES.join(" | ")} (default: general)
   --tier <preset>             Model preset: ${TIER_NAMES.join(" | ")} | <model-id>
   --model <model-id>          Alias for --tier
   --effort <level>            Reasoning effort: ${EFFORT_LEVELS.join(" | ")}
+  --advisor <name>            Named roster advisor from WATCHDOG.yml (e.g. arch, sec)
   --workspace <dir>           Workspace root directory (default: current directory)
   --file <path>               Target file or slice ('path:start-end', 'path#Lstart-Lend', 'path:line') (repeatable)
   --diff                      Include git status and git diff HEAD (or git show HEAD) from workspace
-  --force                     Optional compatibility flag (no rate limits or cooldowns are enforced)
+  --transcript <path>         Optional session transcript.jsonl path for incremental OMP delta review
+  --dump                      Dump formatted peer-shadow transcript (__advisor[.<slug>].jsonl)
+  --dump-raw                  Dump raw JSONL peer-shadow transcript
+  --reset                     Clear AdvisorEmissionGuard deduplication state & transcript cursor for workspace
+  --watchdog <mode>           Configure OMP Watchdog mode: on | off | turn | agent-end | status
+  --timeout <sec>             Optional timeout override in seconds (min: 5, max: 600; defaults to tier preset)
+  --force                     Bypass duplicate-upgrading when re-auditing
   -h, --help                  Show this help message
 `);
 }
 
 function requireArgValue(argv, index, flagName) {
-  if (index + 1 >= argv.length) {
+  if (
+    index + 1 >= argv.length ||
+    argv[index + 1].startsWith("--") ||
+    !argv[index + 1].trim()
+  ) {
     throw new Error(`Missing value for ${flagName}`);
   }
   return argv[index + 1];
@@ -40,46 +61,86 @@ async function main() {
   let focus = "general";
   let tier = "auto";
   let effort = undefined;
+  let advisor = null;
   let workspace = process.cwd();
   const files = [];
   let includeGitDiff = false;
+  let transcriptPath = null;
+  let timeoutMs = undefined;
   let force = false;
   let readStdin = false;
   let showHelp = false;
   let showStatus = false;
+  let dumpMode = null;
+  let doReset = false;
+  let watchdogCmd = null;
   const promptParts = [];
 
   for (let i = 0; i < argv.length; i++) {
-    const arg = argv[i];
+    let arg = argv[i];
+    let inlineVal = undefined;
+    if (arg.startsWith("--") && arg.includes("=")) {
+      const eqIdx = arg.indexOf("=");
+      inlineVal = arg.slice(eqIdx + 1);
+      arg = arg.slice(0, eqIdx);
+    }
+    const nextVal = (flag) => {
+      if (inlineVal !== undefined) {
+        if (!inlineVal.trim()) {
+          throw new Error(`Missing value for ${flag}`);
+        }
+        return inlineVal;
+      }
+      return requireArgValue(argv, i++, flag);
+    };
+    const noVal = (flag) => {
+      if (inlineVal !== undefined) {
+        throw new Error(`Option ${flag} does not take a value`);
+      }
+    };
+
     if (arg === "-h" || arg === "--help") {
+      noVal(arg);
       showHelp = true;
     } else if (arg === "--models" || arg === "--status" || arg === "--log") {
+      noVal(arg);
       showStatus = true;
     } else if (arg === "--focus") {
-      focus = requireArgValue(argv, i++, "--focus");
-    } else if (arg.startsWith("--focus=")) {
-      focus = arg.slice("--focus=".length);
+      focus = nextVal("--focus");
     } else if (arg === "--tier" || arg === "--model") {
-      tier = requireArgValue(argv, i++, arg);
-    } else if (arg.startsWith("--tier=")) {
-      tier = arg.slice("--tier=".length);
-    } else if (arg.startsWith("--model=")) {
-      tier = arg.slice("--model=".length);
+      tier = nextVal(arg);
     } else if (arg === "--effort") {
-      effort = requireArgValue(argv, i++, "--effort");
-    } else if (arg.startsWith("--effort=")) {
-      effort = arg.slice("--effort=".length);
+      effort = nextVal("--effort");
+    } else if (arg === "--advisor") {
+      advisor = nextVal("--advisor");
     } else if (arg === "--workspace") {
-      workspace = requireArgValue(argv, i++, "--workspace");
-    } else if (arg.startsWith("--workspace=")) {
-      workspace = arg.slice("--workspace=".length);
+      workspace = nextVal("--workspace");
     } else if (arg === "--file") {
-      files.push(requireArgValue(argv, i++, "--file"));
-    } else if (arg.startsWith("--file=")) {
-      files.push(arg.slice("--file=".length));
+      files.push(nextVal("--file"));
     } else if (arg === "--diff") {
+      noVal("--diff");
       includeGitDiff = true;
+    } else if (arg === "--transcript") {
+      transcriptPath = nextVal("--transcript");
+    } else if (arg === "--dump") {
+      noVal("--dump");
+      dumpMode = "formatted";
+    } else if (arg === "--dump-raw") {
+      noVal("--dump-raw");
+      dumpMode = "raw";
+    } else if (arg === "--reset") {
+      noVal("--reset");
+      doReset = true;
+    } else if (arg === "--watchdog") {
+      watchdogCmd = nextVal("--watchdog").toLowerCase();
+    } else if (arg === "--timeout") {
+      const sec = Number(nextVal("--timeout"));
+      if (!Number.isFinite(sec) || sec <= 0) {
+        throw new Error("Invalid --timeout value (must be positive seconds)");
+      }
+      timeoutMs = Math.min(Math.max(Math.round(sec * 1000), 5000), 600000);
     } else if (arg === "--force") {
+      noVal("--force");
       force = true;
     } else if (arg === "-") {
       readStdin = true;
@@ -89,7 +150,7 @@ async function main() {
     } else if (arg.startsWith("-")) {
       throw new Error(`Unknown option: ${arg}`);
     } else {
-      promptParts.push(arg);
+      promptParts.push(argv[i]);
     }
   }
 
@@ -98,8 +159,91 @@ async function main() {
     return;
   }
 
+  const dataDir = getDataDir();
+  const resolvedWorkspace = path.resolve(workspace || process.cwd());
+
+  if (doReset) {
+    resetEmissionState(dataDir, resolvedWorkspace);
+    console.log(
+      `Reset AdvisorEmissionGuard deduplication history and transcript cursor for workspace: ${resolvedWorkspace}`
+    );
+    return;
+  }
+
+  if (watchdogCmd) {
+    if (watchdogCmd === "status") {
+      const settings = loadWatchdogRuntimeSettings(dataDir);
+      const mdFiles = discoverWatchdogMarkdownFiles(
+        resolvedWorkspace,
+        isSensitiveFilePath
+      );
+      const roster = discoverWatchdogRoster(
+        resolvedWorkspace,
+        isSensitiveFilePath
+      );
+      console.log(
+        JSON.stringify(
+          {
+            workspace: resolvedWorkspace,
+            settings,
+            watchdogMarkdownFiles: mdFiles.map((m) => m.source),
+            watchdogRoster:
+              roster && roster.sources.length > 0
+                ? {
+                    sources: roster.sources,
+                    settings: roster.settings,
+                    advisors: roster.advisors,
+                  }
+                : null,
+          },
+          null,
+          2
+        )
+      );
+      return;
+    }
+    if (watchdogCmd === "off") {
+      const updated = saveWatchdogRuntimeSettings(dataDir, {
+        enabled: false,
+        reviewMode: "off",
+      });
+      console.log(`OMP Watchdog disabled (${JSON.stringify(updated)})`);
+      return;
+    }
+    if (watchdogCmd === "on" || watchdogCmd === "agent-end") {
+      const updated = saveWatchdogRuntimeSettings(dataDir, {
+        enabled: true,
+        reviewMode: "agent-end",
+      });
+      console.log(
+        `OMP Watchdog enabled in 'agent-end' mode (${JSON.stringify(updated)})`
+      );
+      return;
+    }
+    if (watchdogCmd === "turn") {
+      const updated = saveWatchdogRuntimeSettings(dataDir, {
+        enabled: true,
+        reviewMode: "turn",
+      });
+      console.log(
+        `OMP Watchdog enabled in 'turn' mode (${JSON.stringify(updated)})`
+      );
+      return;
+    }
+    throw new Error(
+      `Invalid --watchdog mode '${watchdogCmd}' (expected: on | off | turn | agent-end | status)`
+    );
+  }
+
+  if (dumpMode) {
+    console.log(
+      dumpAdvisorTranscript(dataDir, advisor, dumpMode === "raw", 20)
+    );
+    return;
+  }
+
   if (showStatus) {
-    const res = await checkAdvisorQuota();
+    const res = await checkAdvisorQuota(resolvedWorkspace);
     console.log(res.text);
     return;
   }
@@ -126,9 +270,12 @@ async function main() {
       focus,
       tier,
       effort,
-      workspace,
+      advisor,
+      workspace: resolvedWorkspace,
       files,
       includeGitDiff,
+      transcriptPath,
+      timeoutMs,
       force,
       signal: controller.signal,
     });

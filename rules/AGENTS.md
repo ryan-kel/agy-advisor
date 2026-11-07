@@ -1,29 +1,27 @@
-# Cross-Model Advisor & EGM Rules ("Automatic Transmission")
+# Cross-Model Advisor Rules (1-Pass High-Taste Partner)
 
-An independent cross-model Goldfish advisor powered by **Claude Sonnet 5.5** (`auto` / `fast` / `sonnet` / `sonnet-high` / `sonnet-medium` / `sonnet-low`), **Claude Opus 5.5** (`deep` / `opus` / `opus-high` / `opus-medium` / `opus-low`), and **GPT-OSS 120B** (`gpt-oss`) is installed in `~/.gemini/config/plugins/advisor/` alongside Google's **Elephant-Goldfish Model (`egm`)** in `~/.gemini/config/plugins/egm/`.
-
-You operate in **Automatic Transmission** mode: the user does **not** need to type slash commands (`/advisor-review`, `/egm-review`, etc.). Trigger the advisor and/or EGM Goldfish subagents proactively from natural conversation.
+An independent cross-model advisor powered by **Claude Opus 5.5** (`deep` / `opus` / `opus-high` / `opus-medium` / `opus-low`), **Claude Sonnet 5.5** (`auto` / `fast` / `sonnet` / `sonnet-high` / `sonnet-medium` / `sonnet-low`), and **GPT-OSS 120B** (`gpt-oss`) is installed in `~/.gemini/config/plugins/advisor/`.
 
 ## 1. Loop Prevention (Read First)
 - If your prompt begins with `[ADVISOR REVIEW REQUEST` or `AGY_ADVISOR_ACTIVE=1` is set in the environment, **you ARE the advisor**. Never call `consult_advisor`, `advisor-consult`, or `invoke_subagent`. Return your structured audit immediately.
 
-## 2. Mandatory Visibility (Always Tell the User)
-- **Never hide an advisor call.** Each `consult_advisor` (`mcp_advisor_mcp_consult_advisor`) or `advisor-consult` run automatically fires a desktop toast pop-up (`notify-send`) and returns a `> [!NOTE] **Advisor Called — ...**` banner. You **MUST** include that `> [!NOTE]` banner at the top of your response to the user showing:
-  1. Which model was called (e.g., `Claude Sonnet 5.5 (Medium)`),
-  2. What it was used on (`focus` and reason),
-  3. Its verdict (`APPROVE` / `REVISE` / `BLOCK`) and what `[Blocker | Major | Nit]` findings it caught, and
-  4. The remaining Claude quota percentage reported by the tool.
+## 2. The 1-Pass Rule (`implement-and-review` Pattern)
+1. **Deterministic Checks First**: Before calling the advisor, run local unit tests (`pytest`, `npm test`, `go test`), linters (including `node ~/shared/tools/ea-lint.mjs` if under `~/sites/`), and `git diff`.
+2. **Strict 1-Pass Cap (Never Loop for `APPROVE`)**: Call `mcp_advisor_mcp_consult_advisor` **at most ONCE per deliverable**.
+   - **Implement -> Verify Locally -> Consult Advisor Once -> Weigh & Finish.**
+   - Treat advisor findings as `<advisory guidance="weigh, don't blindly obey">`: fix verified `[Blocker]` bugs, math errors, or prose/UI slop; ignore speculative edge-case nitpicks or false alarms caused by unattached files; and **never** re-call the advisor in a retry loop chasing an `APPROVE` badge.
+3. **Anti-Slop & Simplification Mandate**: Never respond to an advisor review by bolting on unrequested fallback shims, legacy migration branches, or defensive scaffolding. Prefer deleting unnecessary code and keeping implementations small and readable.
+4. **Model Tiering**:
+   - `tier="auto"` (default): Uses **Claude Sonnet 5.5 (High)** for `plan`, `math`, and `prose`, and **Claude Sonnet 5.5 (Medium)** for `code`, `drift`, and `general`.
+   - Use `tier="deep"` (**Claude Opus 5.5 Medium**) or `tier="opus-high"` (**Claude Opus 5.5 High**) when the user asks for a deep review, architectural simplification, or high-taste editorial critique.
 
-## 3. Execution, Tier Selection & Convergence (No Rate Limits or Cooldowns)
-1. **Deterministic Checks First**: Run local unit tests (`pytest`, `npm test`, `go test`), linters (including `node ~/shared/tools/ea-lint.mjs` if present), and `git diff` so the advisor gets clean, high-signal context.
-2. **No Hourly Caps, Cooldowns, or Rate Limits**: Never refuse or skip an advisor review due to call count or recency. Run the advisor whenever requested or on substantive engineering, quantitative, prose, or spec deliverables.
-3. **Leave `tier="auto"` by Default**: `"auto"` runs in 1-shot Goldfish mode (`excludeDefaultComponents: true`, `tools: []`) using **Claude Sonnet 5.5** (`Medium` for `code`/`plan`/`drift`/`general`, `High` for `math`/`prose`). Use `tier="deep"` or `tier="opus-high"` when an Opus review is requested.
-4. **Severity & Convergence Discipline**: Findings are tagged `[Blocker]`, `[Major]`, or `[Nit]` (use plain-text tags, no emojis). `Nit`s never block `APPROVE`. When addressing a `REVISE` or `BLOCK` verdict, fix verified `[Blocker]`/`[Major]` defects (or note `CONTEST`ed tradeoffs in the prompt if re-auditing) rather than looping on minor nits.
+## 3. Mandatory Visibility (Always Tell the User)
+- Whenever you call `consult_advisor` (`mcp_advisor_mcp_consult_advisor`) or `advisor-consult`, include its `> [!NOTE] **Advisor Called — ...**` banner at the top of your response showing the model used, `focus`, verdict, findings applied vs. skipped, and remaining Claude quota.
 
-## 4. When to Call the Advisor & EGM Automatically (No Slash Commands Required)
-- **Explicit or Natural-Language Requests ("review this", "check my work", "second opinion", "brainstorm/spec this")**: Always run immediately without requiring slash commands.
-- **Architecture & Feature Plans (`focus="plan"`)**: Call `mcp_advisor_mcp_consult_advisor(focus="plan")` to audit plans or specs across EGM's 4 Goldfish lenses (`Zoom-Out`, `Comprehension`, `Design Critic`, `Implementation Readiness`). For greenfield spec drafting or multi-file codebase exploration, you may also invoke the `egm-*` Goldfish subagents (`egm-zoom-out`, `egm-design`, `egm-comprehension`, `egm-implementation-readiness`, `egm-codebase-details`) or skills in `~/.gemini/config/plugins/egm/skills/`.
-- **Multi-File Engineering (`focus="code"`, `include_git_diff=true`)**: Modifying 2+ files with nontrivial control-flow, state/concurrency, database queries, or security/API logic.
-- **Quantitative & Data Claims (`focus="math"`)**: Calculated rates, financial/dollar figures, SQL/data pipelines, or model outputs.
-- **Long-Form Published Prose (`focus="prose"`)**: Published essays, reports, or specifications.
-- **Doc-to-Code Drift (`focus="drift"`)**: Checking `README.md`, `AGENTS.md`, or specs against live code implementation.
+## 4. When to Call the Advisor (1 Pass Only)
+- **Explicit Requests ("review this", "second opinion", "simplify this")**: Run immediately.
+- **Substantive Deliverables (1 Final Check Before Finishing)**:
+  - **Architecture & Plans (`focus="plan"`)**: Before executing a major multi-file design or refactor.
+  - **Multi-File Code (`focus="code"`, `include_git_diff=true`)**: Once after implementing nontrivial multi-file logic and passing local tests.
+  - **Quantitative & Data Claims (`focus="math"`)**: Once to verify denominators, rates, SQL, and dollar figures.
+  - **Published Prose & UI Copy (`focus="prose"`)**: Once after `ea-lint.mjs` is clean to check voice, clarity, and anti-slop quality.

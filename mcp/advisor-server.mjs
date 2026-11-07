@@ -4,11 +4,10 @@ import os from "node:os";
 import path from "node:path";
 import readline from "node:readline";
 import { fileURLToPath, pathToFileURL } from "node:url";
-
-const SERVER_INFO = {
-  name: "advisor-mcp",
-  version: "1.5.0",
-};
+import {
+  SERVER_INFO as DEFAULT_SERVER_INFO,
+  TOOLS as DEFAULT_TOOLS,
+} from "./advisor-core.mjs";
 
 const SUPPORTED_PROTOCOLS = new Set(["2025-03-26", "2024-11-05"]);
 const inflight = new Map();
@@ -54,92 +53,6 @@ async function loadAdvisorCore() {
   }
 }
 
-const TOOLS = [
-  {
-    name: "consult_advisor",
-    description:
-      "Consult the cross-model Goldfish advisor in 1-shot read-only mode to audit implementation plans, code diffs, quantitative/data claims, prose/documentation, or doc-to-code drift. Uses smart auto-tiering by default (Claude Sonnet 5.5 Medium for code/plan/drift/general; Claude Sonnet 5.5 High for math/prose) with [Blocker | Major | Nit] verdict calibration, live 5h/weekly quota telemetry, and no rate limits or cooldowns.",
-    _meta: {
-      "antigravity/alwaysLoad": true,
-    },
-    inputSchema: {
-      type: "object",
-      properties: {
-        prompt: {
-          type: "string",
-          description:
-            "The plan, draft summary, specific calculations, or engineering question you want the advisor to audit.",
-        },
-        focus: {
-          type: "string",
-          enum: ["plan", "code", "prose", "math", "drift", "general"],
-          description:
-            "Review focus mode: 'plan' for 4-lens EGM spec/architecture audits, 'code' for code changes/diffs, 'prose' for essays/docs, 'math' for quantitative/source audits, 'drift' for doc-vs-code drift checks, 'general' for second opinions.",
-        },
-        tier: {
-          type: "string",
-          enum: [
-            "auto",
-            "deep",
-            "opus-high",
-            "opus",
-            "opus-medium",
-            "opus-low",
-            "fast",
-            "sonnet",
-            "sonnet-high",
-            "sonnet-medium",
-            "sonnet-low",
-            "gpt-oss",
-          ],
-          description:
-            "Advisor model tier: 'auto' (default, 1-shot Claude Sonnet 5.5 Medium for code/plan/drift/general and High for math/prose), 'deep'/'opus'/'opus-medium' (Claude Opus 5.5 Medium), 'opus-high' (Claude Opus 5.5 High), 'opus-low' (Claude Opus 5.5 Low), 'fast'/'sonnet'/'sonnet-medium' (Claude Sonnet 5.5 Medium), 'sonnet-high' (Claude Sonnet 5.5 High), 'sonnet-low' (Claude Sonnet 5.5 Low), or 'gpt-oss' (GPT-OSS 120B Medium).",
-        },
-        effort: {
-          type: "string",
-          enum: ["low", "medium", "high", "xhigh", "max"],
-          description:
-            "Optional reasoning effort override ('low', 'medium', 'high', 'xhigh', 'max'). Defaults to the selected tier's preset.",
-        },
-        workspace: {
-          type: "string",
-          description:
-            "Absolute path to the active repository or project directory so the advisor can inspect files and git state directly.",
-        },
-        files: {
-          type: "array",
-          items: { type: "string" },
-          description:
-            "Optional list of specific file paths (up to 8 files, 24 KB each; supports optional 'path:startLine-endLine', 'path#Lstart-Lend', or single-line 'path:line' slicing) for the advisor to read and verify.",
-        },
-        include_git_diff: {
-          type: "boolean",
-          description:
-            "Set true to automatically attach `git status --short` and `git diff HEAD` (or `git show HEAD` when there are no uncommitted tracked changes) from the workspace.",
-        },
-        force: {
-          type: "boolean",
-          description:
-            "Optional compatibility flag (no rate limits or cooldowns are enforced).",
-        },
-      },
-      required: ["prompt"],
-    },
-  },
-  {
-    name: "check_advisor_quota",
-    description:
-      "List available cross-model advisor models in the user's Antigravity subscription and show configured model tiers and live 5-hour + weekly quota status.",
-    _meta: {
-      "antigravity/alwaysLoad": true,
-    },
-    inputSchema: {
-      type: "object",
-      properties: {},
-    },
-  },
-];
-
 function sendMessage(msg) {
   process.stdout.write(JSON.stringify(msg) + "\n");
 }
@@ -162,7 +75,7 @@ function sendError(id, code, message) {
 
 function abortAllAndExit() {
   for (const controller of inflight.values()) {
-    controller.abort();
+    controller.abort("server-exit");
   }
   inflight.clear();
   process.exit(0);
@@ -177,6 +90,7 @@ async function handleRequest(req) {
   const { id, method, params } = req;
 
   if (method === "initialize") {
+    const core = await loadAdvisorCore();
     const requested = params && params.protocolVersion;
     const protocolVersion = SUPPORTED_PROTOCOLS.has(requested)
       ? requested
@@ -186,7 +100,7 @@ async function handleRequest(req) {
       capabilities: {
         tools: {},
       },
-      serverInfo: SERVER_INFO,
+      serverInfo: (core && core.SERVER_INFO) || DEFAULT_SERVER_INFO,
     });
     return;
   }
@@ -210,7 +124,8 @@ async function handleRequest(req) {
   }
 
   if (method === "tools/list") {
-    sendResult(id, { tools: TOOLS });
+    const core = await loadAdvisorCore();
+    sendResult(id, { tools: (core && core.TOOLS) || DEFAULT_TOOLS });
     return;
   }
 
@@ -240,9 +155,14 @@ async function handleRequest(req) {
           focus: args.focus || "general",
           tier: args.tier || "auto",
           effort: args.effort,
+          advisor: args.advisor || null,
           workspace: args.workspace,
           files: Array.isArray(args.files) ? args.files : [],
           includeGitDiff: Boolean(args.include_git_diff),
+          transcriptPath: args.transcript_path || null,
+          timeoutMs: Number.isFinite(args.timeout_ms)
+            ? Math.min(Math.max(Math.round(args.timeout_ms), 5000), 600000)
+            : undefined,
           force: Boolean(args.force),
           signal: controller.signal,
         });

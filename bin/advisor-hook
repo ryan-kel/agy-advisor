@@ -1,0 +1,371 @@
+#!/usr/bin/env node
+import fs from "node:fs";
+import path from "node:path";
+import { spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import {
+  getDataDir,
+  isSensitiveFilePath,
+  runAdvisorConsult,
+  loadEmissionState,
+  updateEmissionState,
+  formatAdvisoryXml,
+  discoverWatchdogRoster,
+  loadWatchdogRuntimeSettings,
+} from "../mcp/advisor-core.mjs";
+
+const __filename = fileURLToPath(import.meta.url);
+
+function getInboxPath(dataDir, key) {
+  const safeKey = String(key || "default")
+    .replace(/[^a-zA-Z0-9._-]/g, "_")
+    .slice(0, 100);
+  return path.join(dataDir, "inbox", `${safeKey}.json`);
+}
+
+function readInbox(dataDir, key) {
+  const filePath = getInboxPath(dataDir, key);
+  try {
+    if (fs.existsSync(filePath)) {
+      const parsed = JSON.parse(fs.readFileSync(filePath, "utf8"));
+      if (Array.isArray(parsed)) return parsed;
+    }
+  } catch {
+    // Ignore read error
+  }
+  return [];
+}
+
+function writeInbox(dataDir, key, items) {
+  const filePath = getInboxPath(dataDir, key);
+  try {
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+    if (!items || items.length === 0) {
+      if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+      return;
+    }
+    const tmpPath = `${filePath}.tmp.${process.pid}`;
+    fs.writeFileSync(tmpPath, JSON.stringify(items, null, 2), "utf8");
+    fs.renameSync(tmpPath, filePath);
+  } catch {
+    // Ignore write error
+  }
+}
+
+function getEffectiveWatchdogConfig(dataDir, cwd) {
+  const runtime = loadWatchdogRuntimeSettings(dataDir);
+  const roster = discoverWatchdogRoster(cwd, isSensitiveFilePath);
+  const rs = roster?.settings || {};
+  const reviewMode = runtime.enabled
+    ? runtime.reviewMode
+    : rs.reviewMode || "off";
+  return {
+    enabled: reviewMode === "turn" || reviewMode === "agent-end",
+    reviewMode,
+    reviewInterval: rs.reviewInterval || runtime.reviewInterval || 1,
+    immuneTurns:
+      typeof rs.immuneTurns === "number"
+        ? rs.immuneTurns
+        : runtime.immuneTurns ?? 3,
+    continueSeverity:
+      rs.continueSeverity || runtime.continueSeverity || "concern",
+    maxNotesPerUpdate:
+      rs.maxNotesPerUpdate || runtime.maxNotesPerUpdate || 4,
+  };
+}
+
+function meetsSeverityThreshold(severity, threshold) {
+  const rank = { nit: 1, concern: 2, blocker: 3 }[severity] || 1;
+  const minRank = { nit: 1, concern: 2, blocker: 3 }[threshold] || 2;
+  return rank >= minRank;
+}
+
+async function runBackgroundWorker({ cwd, conversationId, transcriptPath }) {
+  if (process.env.AGY_ADVISOR_ACTIVE === "1") return;
+  const dataDir = getDataDir();
+  const lockPath = getInboxPath(dataDir, `${conversationId || cwd}.lock`);
+  const lockToken = `${process.pid}:${Date.now()}`;
+  let acquired = false;
+  try {
+    fs.mkdirSync(path.dirname(lockPath), { recursive: true });
+    try {
+      const fd = fs.openSync(lockPath, "wx");
+      fs.writeFileSync(fd, lockToken, "utf8");
+      fs.closeSync(fd);
+      acquired = true;
+    } catch (err) {
+      if (err && err.code && err.code !== "EEXIST") return;
+      const st1 = fs.statSync(lockPath);
+      if (Date.now() - st1.mtimeMs < 180_000) return;
+      const staleTmp = `${lockPath}.stale.${process.pid}.${Date.now()}`;
+      try {
+        fs.renameSync(lockPath, staleTmp);
+        const moved = fs.statSync(staleTmp);
+        if (moved.ino !== st1.ino || moved.mtimeMs !== st1.mtimeMs) {
+          try {
+            fs.linkSync(staleTmp, lockPath);
+          } catch {}
+          return;
+        }
+        const fd = fs.openSync(lockPath, "wx");
+        fs.writeFileSync(fd, lockToken, "utf8");
+        fs.closeSync(fd);
+        acquired = true;
+      } catch {
+        return;
+      } finally {
+        try {
+          if (fs.existsSync(staleTmp)) fs.unlinkSync(staleTmp);
+        } catch {}
+      }
+    }
+
+    const res = await runAdvisorConsult({
+      prompt:
+        "OMP Watchdog background incremental check: review the latest session transcript delta and git state. Emit only concrete [Blocker] or [Concern] issues.",
+      focus: "code",
+      tier: "auto",
+      workspace: cwd,
+      includeGitDiff: true,
+      transcriptPath,
+      conversationId,
+      timeoutMs: 90_000,
+    });
+
+    if (
+      !res.isError &&
+      Array.isArray(res.acceptedFindings) &&
+      res.acceptedFindings.length > 0
+    ) {
+      const inboxKey = conversationId || cwd;
+      const existing = readInbox(dataDir, inboxKey);
+      const nowTurns = 0;
+      for (const f of res.acceptedFindings) {
+        existing.push({
+          ...f,
+          turnsAgo: nowTurns,
+          queuedAt: new Date().toISOString(),
+        });
+      }
+      writeInbox(dataDir, inboxKey, existing.slice(-16));
+    }
+  } catch {
+    // Ignore background worker error
+  } finally {
+    if (acquired) {
+      try {
+        if (
+          fs.existsSync(lockPath) &&
+          fs.readFileSync(lockPath, "utf8").trim() === lockToken
+        ) {
+          fs.unlinkSync(lockPath);
+        }
+      } catch {}
+    }
+  }
+}
+
+async function main() {
+  // Never run inside the advisor child process itself
+  if (process.env.AGY_ADVISOR_ACTIVE === "1") {
+    process.stdout.write("{}\n");
+    return;
+  }
+
+  const subcommand = process.argv[2] || "";
+
+  if (subcommand === "worker") {
+    const cwd = process.argv[3] || process.cwd();
+    const conversationId = process.argv[4] || "";
+    const transcriptPath = process.argv[5] || "";
+    await runBackgroundWorker({ cwd, conversationId, transcriptPath });
+    return;
+  }
+
+  let rawStdin = "";
+  try {
+    rawStdin = fs.readFileSync(0, "utf8").trim();
+  } catch {
+    process.stdout.write("{}\n");
+    return;
+  }
+
+  let input = {};
+  if (rawStdin) {
+    try {
+      input = JSON.parse(rawStdin);
+    } catch {
+      process.stdout.write("{}\n");
+      return;
+    }
+  }
+
+  const cwd = path.resolve(input.cwd || process.cwd());
+  const conversationId = input.conversationId || "";
+  const transcriptPath = input.transcriptPath || "";
+  const inboxKey = conversationId || cwd;
+  const dataDir = getDataDir();
+
+  if (subcommand === "pre-invocation") {
+    const queued = readInbox(dataDir, inboxKey);
+    if (queued.length === 0) {
+      process.stdout.write("{}\n");
+      return;
+    }
+    writeInbox(dataDir, inboxKey, []);
+    const xmlMessages = queued
+      .map((item) => formatAdvisoryXml(item, item.advisor || "watchdog"))
+      .join("\n\n");
+    process.stdout.write(
+      JSON.stringify({
+        injectSteps: [
+          {
+            ephemeralMessage: xmlMessages,
+          },
+        ],
+      }) + "\n"
+    );
+    return;
+  }
+
+  if (subcommand === "post-invocation") {
+    let currentTurnCount = 0;
+    updateEmissionState(dataDir, (state) => {
+      if (!state.workspaces[cwd]) {
+        state.workspaces[cwd] = {
+          history: [],
+          quarantineCount: 0,
+          turnsSinceLastSteer: 999,
+          turnCount: 0,
+          lastReviewedStepIndex: 0,
+        };
+      }
+      const ws = state.workspaces[cwd];
+      ws.turnsSinceLastSteer = (ws.turnsSinceLastSteer ?? 999) + 1;
+      ws.turnCount = (ws.turnCount ?? 0) + 1;
+      currentTurnCount = ws.turnCount;
+    });
+
+    // Age any queued inbox items by 1 turn
+    const queued = readInbox(dataDir, inboxKey);
+    if (queued.length > 0) {
+      for (const item of queued) {
+        item.turnsAgo = (item.turnsAgo || 0) + 1;
+      }
+      writeInbox(dataDir, inboxKey, queued);
+    }
+
+    const cfg = getEffectiveWatchdogConfig(dataDir, cwd);
+    if (
+      cfg.enabled &&
+      cfg.reviewMode === "turn" &&
+      currentTurnCount % Math.max(1, cfg.reviewInterval) === 0
+    ) {
+      try {
+        const child = spawn(
+          process.execPath,
+          [__filename, "worker", cwd, conversationId, transcriptPath],
+          {
+            cwd,
+            detached: true,
+            stdio: "ignore",
+            env: { ...process.env },
+          }
+        );
+        child.unref();
+      } catch {
+        // Ignore spawn failure
+      }
+    }
+
+    process.stdout.write("{}\n");
+    return;
+  }
+
+  if (subcommand === "stop") {
+    if (
+      input.stopHookActive ||
+      (input.stopHookType && input.stopHookType !== "NO_TOOL_CALL")
+    ) {
+      process.stdout.write("{}\n");
+      return;
+    }
+
+    const cfg = getEffectiveWatchdogConfig(dataDir, cwd);
+    const state = loadEmissionState(dataDir);
+    const ws = state.workspaces?.[cwd] || { turnsSinceLastSteer: 999 };
+    const turnsSinceLastSteer = ws.turnsSinceLastSteer ?? 999;
+
+    // Respect OMP immuneTurns (default 3) so Stop hook never loops endlessly
+    if (turnsSinceLastSteer < cfg.immuneTurns) {
+      process.stdout.write("{}\n");
+      return;
+    }
+
+    let queued = readInbox(dataDir, inboxKey);
+    if (
+      queued.length === 0 &&
+      cfg.enabled &&
+      cfg.reviewMode === "agent-end"
+    ) {
+      const res = await runAdvisorConsult({
+        prompt:
+          "OMP Watchdog agent-end check: review the latest session transcript delta and git changes before the agent yields. Emit only concrete [Blocker] or [Concern] issues.",
+        focus: "code",
+        tier: "auto",
+        workspace: cwd,
+        includeGitDiff: true,
+        transcriptPath,
+        conversationId,
+        timeoutMs: 90_000,
+      });
+      if (!res.isError && Array.isArray(res.acceptedFindings)) {
+        queued = res.acceptedFindings;
+      }
+    }
+
+    const qualifying = queued.filter((item) =>
+      meetsSeverityThreshold(item.severity, cfg.continueSeverity)
+    );
+
+    if (qualifying.length === 0) {
+      writeInbox(dataDir, inboxKey, []);
+      process.stdout.write("{}\n");
+      return;
+    }
+
+    // Clear inbox and reset turnsSinceLastSteer
+    writeInbox(dataDir, inboxKey, []);
+    updateEmissionState(dataDir, (st) => {
+      if (!st.workspaces[cwd]) {
+        st.workspaces[cwd] = {
+          history: [],
+          quarantineCount: 0,
+          turnsSinceLastSteer: 0,
+          turnCount: 0,
+          lastReviewedStepIndex: 0,
+        };
+      } else {
+        st.workspaces[cwd].turnsSinceLastSteer = 0;
+      }
+    });
+
+    const xmlReason = qualifying
+      .map((item) => formatAdvisoryXml(item, item.advisor || "watchdog"))
+      .join("\n\n");
+
+    process.stdout.write(
+      JSON.stringify({
+        decision: "continue",
+        reason: xmlReason,
+      }) + "\n"
+    );
+    return;
+  }
+
+  process.stdout.write("{}\n");
+}
+
+main().catch(() => {
+  process.stdout.write("{}\n");
+});

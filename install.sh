@@ -33,7 +33,7 @@ if command -v rsync >/dev/null 2>&1; then
     --exclude='install.sh' \
     "$SRC_DIR/" "$DEST_DIR/"
 else
-  for item in plugin.json mcp_config.json README.md assets bin mcp agents skills rules; do
+  for item in plugin.json mcp_config.json hooks.json README.md assets bin mcp agents skills rules; do
     if [[ -e "$SRC_DIR/$item" ]]; then
       tmp="$DEST_DIR/.$item.new.$$"
       rm -rf "$tmp"
@@ -44,8 +44,33 @@ else
   done
 fi
 
-chmod +x "$DEST_DIR/bin/advisor-consult" "$DEST_DIR/bin/run-mcp-server" "$DEST_DIR/mcp/advisor-server.mjs"
+chmod +x "$DEST_DIR/bin/advisor-consult" "$DEST_DIR/bin/advisor-hook" "$DEST_DIR/bin/run-mcp-server" "$DEST_DIR/mcp/advisor-server.mjs"
 ln -sf "$DEST_DIR/bin/advisor-consult" "$BIN_DIR/advisor-consult"
+
+# Refresh cached MCP tool schema files in ~/.gemini/antigravity/mcp/advisor_mcp if present
+NODE_CMD="node"
+if [[ -x "$HOME/opt/node/bin/node" ]]; then
+  NODE_CMD="$HOME/opt/node/bin/node"
+elif [[ -x "$HOME/.local/bin/node" ]]; then
+  NODE_CMD="$HOME/.local/bin/node"
+fi
+if command -v "$NODE_CMD" >/dev/null 2>&1; then
+  "$NODE_CMD" --input-type=module - "$DEST_DIR/mcp/advisor-core.mjs" <<'EOF' 2>/dev/null || true
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { pathToFileURL } from "node:url";
+const { TOOLS } = await import(pathToFileURL(process.argv[2]).href);
+const mcpCacheDir = path.join(os.homedir(), ".gemini/antigravity/mcp/advisor_mcp");
+if (fs.existsSync(path.dirname(mcpCacheDir))) {
+  fs.mkdirSync(mcpCacheDir, { recursive: true });
+  for (const t of TOOLS) {
+    const out = { name: t.name, description: t.description, parameters: t.inputSchema };
+    fs.writeFileSync(path.join(mcpCacheDir, `${t.name}.json`), JSON.stringify(out));
+  }
+}
+EOF
+fi
 
 if command -v agy >/dev/null 2>&1; then
   agy plugin validate "$DEST_DIR" --strict
