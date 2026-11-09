@@ -9,14 +9,14 @@ Designed to work standalone or alongside Google's **Elephant-Goldfish Model (`eg
 ## Quick Install on Any Machine
 
 ```bash
-git clone git@github.com:ryan-kel/agy-advisor.git ~/dev/projects/agy-advisor
-bash ~/dev/projects/agy-advisor/install.sh
+git clone git@github.com:ryan-kel/agy-advisor.git ~/dev/labs/agy-advisor
+bash ~/dev/labs/agy-advisor/install.sh
 ```
 
 Or to update an existing checkout:
 
 ```bash
-cd ~/dev/projects/agy-advisor && git pull && bash install.sh
+cd ~/dev/labs/agy-advisor && git pull && bash install.sh
 ```
 
 ## Bundled Components
