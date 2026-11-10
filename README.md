@@ -1,19 +1,18 @@
-# Cross-Model Goldfish & OMP Watchdog Advisor Plugin (`agy-advisor`)
+# Portable Antigravity + MuseCode Environment & Cross-Model Advisor (`agy-advisor`)
 
-Native Antigravity plugin (`v2.0.0`) that combines an independent, 1-shot cross-model **Goldfish** verification gate with the **OMP (`oh-my-pi`) Advisor & Watchdog** supervision architecture using your Antigravity subscription models (**Claude Sonnet 5.5**, **Claude Opus 5.5**, and **GPT-OSS 120B**).
+Portable Antigravity environment bundle and on-demand cross-model advisor (`v2.1.0`) that syncs:
+1. **Global Rules (`~/.gemini/config/AGENTS.md` & `~/AGENTS.md`)**: Canonical `~/dev/` layout, 4-tier truth hierarchy, sequential execution/hardware stability guardrails, and **`MuseCode` (`~/.local/bin/muse exec`)** routing.
+2. **Global Skills (`~/.gemini/config/skills/`)**: Electoral Analytics [`ea-prose`](global/skills/ea-prose/SKILL.md) and [`ea-publish`](global/skills/ea-publish/SKILL.md).
+3. **Standalone `advisor-consult` CLI (`~/.local/bin/advisor-consult`) & Optional Plugin**: Defaults `--tier auto` to **MuseCode (`muse-wonder-full-1.0`)** via standalone `muse exec` (zero load on Antigravity's `language_server`), with fallback/explicit routing to **Claude Opus 5.5**, **Claude Sonnet 5.5**, and **GPT-OSS 120B**. By default, `install.sh` leaves the always-on MCP plugin disabled so normal Antigravity turns stay fast and lean (`31` lines of rules total); pass `--enable-plugin` if you want the MCP plugin active.
 
-Features deterministic `[Blocker | Concern | Nit]` (`[Major]` alias) verdict calibration, **`AdvisorEmissionGuard`** NFKC deduplication and severity budgeting, hierarchical **`WATCHDOG.md`** (`@path` import expansion) & **`WATCHDOG.yml`** multi-advisor rosters, incremental **`transcript.jsonl`** peer-shadow delta compression, non-blocking **`hooks.json`** (`PreInvocation`, `PostInvocation`, `Stop`) supervision, live 5-hour and weekly quota telemetry, and **no hourly caps, cooldowns, or rate limits**.
-
-Designed to work standalone or alongside Google's **Elephant-Goldfish Model (`egm`)** plugin (`~/.gemini/config/plugins/egm`).
-
-## Quick Install on Any Machine
+## Quick Install / Sync on Any Machine (Home or Work)
 
 ```bash
 git clone git@github.com:ryan-kel/agy-advisor.git ~/dev/labs/agy-advisor
 bash ~/dev/labs/agy-advisor/install.sh
 ```
 
-Or to update an existing checkout:
+Or to update an existing checkout on your work machine:
 
 ```bash
 cd ~/dev/labs/agy-advisor && git pull && bash install.sh

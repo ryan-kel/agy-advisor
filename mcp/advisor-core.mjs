@@ -46,6 +46,23 @@ const HOME = os.homedir();
 const AGY_BIN = fs.existsSync(path.join(HOME, ".local/bin/agy"))
   ? path.join(HOME, ".local/bin/agy")
   : "agy";
+const MUSE_BIN = fs.existsSync(path.join(HOME, ".local/bin/muse"))
+  ? path.join(HOME, ".local/bin/muse")
+  : "muse";
+
+function isMuseAvailable() {
+  const binExists =
+    fs.existsSync(path.join(HOME, ".local/bin/muse")) ||
+    fs.existsSync("/usr/local/bin/muse") ||
+    fs.existsSync("/usr/bin/muse");
+  const authPath =
+    process.env.MUSE_AUTH_PATH ||
+    path.join(
+      process.env.XDG_CONFIG_HOME || path.join(HOME, ".config"),
+      "muse/auth.json"
+    );
+  return binExists && fs.existsSync(authPath);
+}
 const NODE_BIN = fs.existsSync(path.join(HOME, "opt/node/bin/node"))
   ? path.join(HOME, "opt/node/bin/node")
   : fs.existsSync(path.join(HOME, ".local/bin/node"))
@@ -131,6 +148,10 @@ export const TOOLS = [
           type: "string",
           enum: [
             "auto",
+            "muse",
+            "muse-xhigh",
+            "muse-high",
+            "muse-medium",
             "deep",
             "opus-high",
             "opus",
@@ -144,7 +165,7 @@ export const TOOLS = [
             "gpt-oss",
           ],
           description:
-            "Advisor model tier: 'auto' (default, 1-shot Claude Sonnet 5.5 Medium for code/plan/drift/general and High for math/prose), 'deep'/'opus'/'opus-medium' (Claude Opus 5.5 Medium), 'opus-high' (Claude Opus 5.5 High), 'opus-low' (Claude Opus 5.5 Low), 'fast'/'sonnet'/'sonnet-medium' (Claude Sonnet 5.5 Medium), 'sonnet-high' (Claude Sonnet 5.5 High), 'sonnet-low' (Claude Sonnet 5.5 Low), or 'gpt-oss' (GPT-OSS 120B Medium).",
+            "Advisor model tier: 'auto' (default, uses Muse Wonder Full 1.0 via standalone `muse exec` when MuseCode is authenticated, falling back to Claude Sonnet 5.5), 'muse'/'muse-high' (Muse Wonder Full 1.0 High), 'muse-xhigh' (Muse Wonder Full 1.0 xHigh), 'muse-medium' (Muse Wonder Full 1.0 Medium), 'deep'/'opus'/'opus-medium' (Claude Opus 5.5 Medium), 'opus-high' (Claude Opus 5.5 High), 'opus-low' (Claude Opus 5.5 Low), 'fast'/'sonnet'/'sonnet-medium' (Claude Sonnet 5.5 Medium), 'sonnet-high' (Claude Sonnet 5.5 High), 'sonnet-low' (Claude Sonnet 5.5 Low), or 'gpt-oss' (GPT-OSS 120B Medium).",
         },
         effort: {
           type: "string",
@@ -209,6 +230,34 @@ export const TOOLS = [
 ];
 
 export const TIER_PRESETS = {
+  muse: {
+    model: "muse-wonder-full-1.0",
+    effort: "high",
+    label: "Muse Wonder Full 1.0 (High)",
+    timeoutMs: 180_000,
+    engine: "muse",
+  },
+  "muse-xhigh": {
+    model: "muse-wonder-full-1.0",
+    effort: "xhigh",
+    label: "Muse Wonder Full 1.0 (xHigh)",
+    timeoutMs: 240_000,
+    engine: "muse",
+  },
+  "muse-high": {
+    model: "muse-wonder-full-1.0",
+    effort: "high",
+    label: "Muse Wonder Full 1.0 (High)",
+    timeoutMs: 180_000,
+    engine: "muse",
+  },
+  "muse-medium": {
+    model: "muse-wonder-full-1.0",
+    effort: "medium",
+    label: "Muse Wonder Full 1.0 (Medium)",
+    timeoutMs: 120_000,
+    engine: "muse",
+  },
   deep: {
     model: "claude-opus-5-5-medium",
     effort: "medium",
@@ -622,7 +671,12 @@ function resolveTierAndModel(
   // - Code, drift, and general checks use Claude Sonnet 5.5 (Medium) in 1-shot mode
   // - Use `deep` (Opus 5.5 Medium) or `opus-high` when explicitly requested
   if (key === "auto") {
-    if (focus === "plan" || focus === "math" || focus === "prose") {
+    if (isMuseAvailable()) {
+      key =
+        focus === "plan" || focus === "math" || focus === "prose"
+          ? "muse-high"
+          : "muse-medium";
+    } else if (focus === "plan" || focus === "math" || focus === "prose") {
       key = "sonnet-high";
     } else {
       key = "sonnet-medium";
@@ -640,8 +694,10 @@ function resolveTierAndModel(
       effort: normalizedEffort || TIER_PRESETS[key].effort,
       label: TIER_PRESETS[key].label,
       timeoutMs: TIER_PRESETS[key].timeoutMs,
+      engine: TIER_PRESETS[key].engine || "agy",
     };
   }
+  const isMuse = key.startsWith("muse");
   const isOpus = key.includes("opus");
   const isHigh = normalizedEffort === "high" || key.endsWith("-high");
   return {
@@ -649,6 +705,7 @@ function resolveTierAndModel(
     effort: normalizedEffort || "medium",
     label: key,
     timeoutMs: isOpus ? (isHigh ? 300_000 : 240_000) : isHigh ? 180_000 : 120_000,
+    engine: isMuse ? "muse" : "agy",
   };
 }
 
@@ -1497,6 +1554,7 @@ export async function runAdvisorConsult({
     effort: resolvedEffort,
     label,
     timeoutMs: tierTimeoutMs,
+    engine = "agy",
   } = resolveTierAndModel(effectiveTier, effort, ctx.focusKey);
 
   const effectiveTimeoutMs = timeoutMs || tierTimeoutMs || 120_000;
@@ -1514,21 +1572,52 @@ export async function runAdvisorConsult({
   // so Node's timer always owns timeout detection and never mistakes an agy print-timeout for exitCode 0.
   const totalSec = Math.max(15, Math.floor(effectiveTimeoutMs / 1000));
   const printTimeoutSec = totalSec + 10;
-  const args = [
-    "--agent",
-    "advisor-engine",
-    "--model",
-    model,
-    "--effort",
-    resolvedEffort,
-    "--mode",
-    "plan",
-    "--sandbox",
-    "--disable-slash-commands",
-    "--print-timeout",
-    `${printTimeoutSec}s`,
-    `-p=${fullPrompt}`,
-  ];
+  const useMuse = engine === "muse";
+  let tmpPromptFile = null;
+  if (useMuse) {
+    tmpPromptFile = path.join(
+      os.tmpdir(),
+      `advisor-prompt-${process.pid}-${Date.now()}.txt`
+    );
+    fs.writeFileSync(tmpPromptFile, fullPrompt, { encoding: "utf8", mode: 0o600 });
+  }
+  const cleanTmpPrompt = () => {
+    if (tmpPromptFile) {
+      try {
+        fs.unlinkSync(tmpPromptFile);
+      } catch {}
+      tmpPromptFile = null;
+    }
+  };
+  const spawnBin = useMuse ? MUSE_BIN : AGY_BIN;
+  const args = useMuse
+    ? [
+        "exec",
+        "--preset",
+        "empty",
+        "--no-session-log",
+        "--model",
+        model,
+        "--reasoning-effort",
+        resolvedEffort,
+        "--prompt-file",
+        tmpPromptFile,
+      ]
+    : [
+        "--agent",
+        "advisor-engine",
+        "--model",
+        model,
+        "--effort",
+        resolvedEffort,
+        "--mode",
+        "plan",
+        "--sandbox",
+        "--disable-slash-commands",
+        "--print-timeout",
+        `${printTimeoutSec}s`,
+        `-p=${fullPrompt}`,
+      ];
 
   // Fire visible desktop toast so the user sees immediately when the advisor runs
   sendDesktopToast(
@@ -1541,7 +1630,7 @@ export async function runAdvisorConsult({
   return new Promise((resolve) => {
     let child;
     try {
-      child = spawn(AGY_BIN, args, {
+      child = spawn(spawnBin, args, {
         cwd: fs.existsSync(ctx.resolvedWorkspace)
           ? ctx.resolvedWorkspace
           : HOME,
@@ -1554,9 +1643,10 @@ export async function runAdvisorConsult({
         stdio: ["ignore", "pipe", "pipe"],
       });
     } catch (err) {
+      cleanTmpPrompt();
       resolve({
         isError: true,
-        text: `Failed to spawn agy (${AGY_BIN}): ${err.message}`,
+        text: `Failed to spawn ${spawnBin}: ${err.message}`,
       });
       return;
     }
@@ -1636,15 +1726,17 @@ export async function runAdvisorConsult({
 
     child.on("error", (err) => {
       clearTimeout(timer);
+      cleanTmpPrompt();
       if (signal) signal.removeEventListener("abort", onAbort);
       resolve({
         isError: true,
-        text: `Failed to spawn agy (${AGY_BIN}): ${err.message}`,
+        text: `Failed to spawn ${spawnBin}: ${err.message}`,
       });
     });
 
     child.on("close", async (code, exitSignal) => {
       clearTimeout(timer);
+      cleanTmpPrompt();
       if (signal) signal.removeEventListener("abort", onAbort);
       const durationMs = Date.now() - startTime;
       const cleanOut = stdout.trim();
